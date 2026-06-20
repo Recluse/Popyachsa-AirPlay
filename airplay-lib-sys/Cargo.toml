@@ -1,0 +1,12 @@
+[package]
+name = "airplay-lib-sys"
+version = "0.1.0"
+edition = "2021"
+description = "Raw FFI bindings to uxplay-core (the embeddable UxPlay AirPlay engine)"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+# Runtime DLL loading via LoadLibrary/GetProcAddress — deliberately avoids a
+# link-time import library so an MSVC-built consumer can load the MinGW-built
+# uxplay-core.dll without ABI/import-lib friction.
+libloading = "0.8"

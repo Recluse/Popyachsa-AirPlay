@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Popyachsa AirPlay
+GenericName=AirPlay Receiver
+Comment=Mirror your iPhone, iPad or Mac to this computer over Wi-Fi
+Exec=popyachsa-airplay
+Icon=com.popyachsa.AirPlay
+Terminal=false
+Categories=AudioVideo;Player;Network;
+Keywords=AirPlay;mirroring;screen;cast;iPhone;iPad;Mac;receiver;
+StartupNotify=false

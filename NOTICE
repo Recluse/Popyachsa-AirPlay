@@ -1,0 +1,48 @@
+Popyachsa AirPlay
+Copyright (C) 2026 Recluse <me@recluse.lol>
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version. See the LICENSE file for the full text.
+
+================================================================================
+Credit chain & third-party components
+================================================================================
+
+This product builds on the work of others. The AirPlay engine is a fork of
+UxPlay and is therefore GPL-3.0; everything that links the engine inherits that
+licence. The bundled/linked runtimes keep their own licences.
+
+AirPlay protocol + GStreamer engine
+  UxPlay — https://github.com/FDH2/UxPlay — GPL-3.0
+    UxPlay descends from:
+      RPiPlay      — https://github.com/FD-/RPiPlay        — GPL-3.0
+      shairplay    — https://github.com/juhovh/shairplay   — (Juho Vähä-Herttua)
+      playfair / openairplay — AirPlay reverse-engineering notes
+    See UxPlay's own README for the complete upstream credit chain.
+
+mDNS responder (used by the Windows dnssd shim)
+  mjansson/mdns — https://github.com/mjansson/mdns — public domain (Unlicense)
+    A self-contained RFC 6762 / 6763 mDNS responder, single header.
+
+Media pipeline (dynamically linked / bundled as-is, not modified)
+  GStreamer — https://gstreamer.freedesktop.org — LGPL-2.1
+  GLib      — https://gitlab.gnome.org/GNOME/glib — LGPL-2.1
+
+Cryptography (pulled in by the engine)
+  OpenSSL   — https://www.openssl.org — Apache-2.0
+
+Rust crates (all permissive — MIT / Apache-2.0)
+  tao, tray-icon, muda, eframe/egui, winit, raw-window-handle, windows-rs,
+  x11 / x11rb, ureq (+ rustls), ed25519-compact, sha2, hex, zip, serde,
+  serde_json, semver, dirs, image, anyhow. See each crate's own licence.
+
+Apple Bonjour SDK (OPTIONAL Windows build dependency — NOT redistributed here)
+  Proprietary. Only needed to build the optional Bonjour-proxy path of the
+  Windows dnssd shim; the embedded-mdns path needs nothing from Apple. Bring
+  your own SDK if you build that path. Never committed to this repository.
+
+================================================================================
+The same credit chain is shown in the application's About window and must be
+preserved in any redistribution.

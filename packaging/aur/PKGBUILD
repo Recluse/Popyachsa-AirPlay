@@ -1,0 +1,39 @@
+# Maintainer: Recluse <me@recluse.lol>
+#
+# DRAFT — binary AUR package over the published Linux release tarball.
+# Before publishing: (1) publish the tarball at the source= URL with the layout in
+# ../README.md, (2) replace sha256sums 'SKIP' with the real hash, (3) regenerate
+# .SRCINFO:  makepkg --printsrcinfo > .SRCINFO
+pkgname=popyachsa-airplay-bin
+_appid=com.popyachsa.AirPlay
+pkgver=0.2.7
+pkgrel=1
+pkgdesc="AirPlay receiver — mirror iPhone, iPad or Mac to your screen (Wi-Fi, low-latency)"
+arch=('x86_64')
+url="https://airplay.popyachsa.com"
+license=('GPL-3.0-or-later')
+depends=('avahi' 'gtk3' 'gst-libav' 'gst-plugins-base' 'gst-plugins-good'
+         'gst-plugins-bad' 'libplist' 'openssl' 'libayatana-appindicator' 'xdotool')
+optdepends=('gstreamer-vaapi: Intel/AMD hardware H.264/H.265 decode'
+            'intel-media-driver: Intel HW decode (Gen8+)'
+            'libva-mesa-driver: AMD / older-Intel HW decode')
+provides=('popyachsa-airplay')
+conflicts=('popyachsa-airplay')
+options=('!strip')   # binary + .so are already stripped at release
+source=("popyachsa-airplay-${pkgver}-x86_64.tar.gz::https://dl.airplay.popyachsa.com/popyachsa-airplay-${pkgver}-x86_64.tar.gz")
+sha256sums=('3c745d4105903e05b0010bf9a7185e3fba3e9c1a50b96dffae2ade8cb4e8f365')
+
+package() {
+    cd "$srcdir"
+    # Engine binary + dlopen'd core, co-located (core_so_path finds the .so next
+    # to the binary that current_exe() resolves the /usr/bin symlink to).
+    install -dm755 "$pkgdir/usr/lib/popyachsa-airplay"
+    install -m755 popyachsa-airplay "$pkgdir/usr/lib/popyachsa-airplay/popyachsa-airplay"
+    install -m755 uxplay-core.so    "$pkgdir/usr/lib/popyachsa-airplay/uxplay-core.so"
+    install -dm755 "$pkgdir/usr/bin"
+    ln -s ../lib/popyachsa-airplay/popyachsa-airplay "$pkgdir/usr/bin/popyachsa-airplay"
+
+    install -Dm644 "${_appid}.desktop"      "$pkgdir/usr/share/applications/${_appid}.desktop"
+    install -Dm644 "${_appid}.png"          "$pkgdir/usr/share/icons/hicolor/256x256/apps/${_appid}.png"
+    install -Dm644 "${_appid}.metainfo.xml" "$pkgdir/usr/share/metainfo/${_appid}.metainfo.xml"
+}

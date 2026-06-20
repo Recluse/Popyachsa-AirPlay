@@ -1,0 +1,100 @@
+[package]
+name = "popyachsa-airplay"
+version = "0.2.8"
+edition = "2021"
+authors = ["Popyachsa AirPlay contributors"]
+description = "AirPlay receiver for Windows, Linux and macOS — in-process patched-UxPlay engine + tray"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/Recluse/Popyachsa-AirPlay"
+homepage = "https://airplay.popyachsa.com"
+
+[[bin]]
+name = "popyachsa-airplay"
+path = "src/main.rs"
+
+# Tiny self-update helper: waits for the app to exit, downloads + verifies the
+# new release zip, swaps the install folder in place and relaunches.
+[[bin]]
+name = "updater"
+path = "src/bin/updater.rs"
+
+[dependencies]
+airplay-lib = { path = "../airplay-lib" }
+# Update channel: HTTPS fetch (rustls), Ed25519 signature verify, zip extract.
+ureq           = { version = "2", features = ["tls"] }
+ed25519-compact = "2"
+sha2           = "0.10"
+hex            = "0.4"
+semver         = "1"
+zip            = { version = "2", default-features = false, features = ["deflate"] }
+tray-icon = "0.24"
+tao        = "0.34"
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow     = "1"
+dirs       = "5"
+image      = { version = "0.25", default-features = false, features = ["ico", "png"] }
+# Settings dialog: spawned as a separate `popyachsa-tv.exe --settings` process,
+# so eframe can own its event loop without colliding with our tray's tao loop.
+eframe     = { version = "=0.29", default-features = false, features = [
+    "default_fonts", "glow",
+] }
+egui       = "=0.29"
+
+# Linux: raw Xlib for the engine's host window (GstVideoOverlay XID target).
+[target.'cfg(target_os = "linux")'.dependencies]
+x11 = { version = "2", features = ["xlib"] }
+
+# Unix (Linux/macOS): dup2 stdout/stderr onto the engine log file.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Registry",
+    "Win32_System_Services",
+    "Win32_System_LibraryLoader",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+]
+
+# macOS mirror window: pull the NSView* out of the tao window (M3 engine driver).
+# Single version across the tree (tao 0.34 already uses raw-window-handle 0.6.2).
+[target.'cfg(target_os = "macos")'.dependencies]
+raw-window-handle = "0.6"
+
+[profile.release]
+opt-level   = "z"     # optimize for size — this is a tiny tray app
+lto         = true
+codegen-units = 1
+strip       = true
+panic       = "abort"
+
+# panic=abort in DEBUG too: an `extern "C"` callback that unwound a panic into C
+# frames is UB, and debug/smoke builds default to unwind. The callbacks already
+# `catch_unwind` their bodies (the real guard); this is belt-and-suspenders so no
+# build flavor can unwind across FFI. (No `cargo test` in this crate, so abort
+# here doesn't need -Zpanic-abort-tests.)
+[profile.dev]
+panic = "abort"
+
+# Embeds icons/app.ico as the exe icon resource (id 1) — used by Explorer, the
+# taskbar, and our host window's WNDCLASS (see build.rs + engine.rs). Windows-only.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+[package.metadata.winresource]
+OriginalFilename = "popyachsa-airplay.exe"
+ProductName      = "Popyachsa AirPlay"
+FileDescription  = "AirPlay receiver tray manager"

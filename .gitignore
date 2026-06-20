@@ -1,0 +1,26 @@
+# Rust build output
+/target
+**/target
+
+# Windows dist bundle + the dnssd shim placed next to make-dist
+/app/dist
+/app/dnssd.dll
+
+# Engine artifacts — built from third_party/uxplay (BUILD.md), never committed
+*.dll
+*.so
+*.dylib
+
+# Packaged release binaries — go in GitHub Releases, not git
+*.exe
+*.AppImage
+*.AppImage.zsync
+*.deb
+*.rpm
+*.dmg
+/build/macos/dist
+*.zip
+
+# OS / editor
+.DS_Store
+Thumbs.db

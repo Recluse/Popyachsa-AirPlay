@@ -1,0 +1,69 @@
+# DRAFT Flatpak manifest (flatpak-builder).
+#
+# Correct parts (runtime, finish-args, mDNS-over-Avahi, layout) are final; the
+# `sources:` are placeholders — see TODOs and ../README.md. H.264/H.265 are covered
+# by the runtime's gst-libav + org.freedesktop.Platform.codecs-extra (auto-installs
+# with 24.08), so no codec module is needed.
+app-id: com.popyachsa.AirPlay
+runtime: org.freedesktop.Platform
+runtime-version: '24.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: popyachsa-airplay
+
+finish-args:
+  - --share=ipc
+  - --socket=fallback-x11
+  - --socket=wayland
+  - --socket=pulseaudio
+  - --share=network
+  - --device=dri
+  # mDNS: no portal exists (2024-2026). libavahi-compat-libdnssd talks to the host
+  # Avahi over D-Bus — a NARROW talk-name, never --socket=system-bus (Flathub rejects).
+  # Host MUST run avahi-daemon. NB: glibc/NSS .local->IP doesn't cross the sandbox;
+  # resolve via Avahi (PLAN-LINUX L9).
+  - --system-talk-name=org.freedesktop.Avahi
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/popyachsa-airplay/cargo
+
+modules:
+  # 1) The patched UxPlay fork built as the flat-C-ABI uxplay-core.so.
+  - name: uxplay-core
+    buildsystem: cmake-ninja
+    config-opts:
+      - -DCMAKE_BUILD_TYPE=Release
+      - -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+      - -DNO_MARCH_NATIVE=ON
+    # Install uxplay-core.so into /app/lib (on the Flatpak loader path -> the bare
+    # "uxplay-core.so" fallback in engine_linux::core_so_path resolves it).
+    post-install:
+      - install -Dm755 uxplay-core.so /app/lib/uxplay-core.so
+    sources:
+      # TODO: UxPlay fork + clean-full-vs-v1.73.6.diff (and the target that emits
+      # the flat-C-ABI uxplay-core.so).
+      - type: git
+        url: https://github.com/FDH2/UxPlay.git
+        tag: v1.73.6
+        # commit: <pin>
+      - type: patch
+        path: ../../popyachsa-airplay-core/clean-full-vs-v1.73.6.diff
+
+  # 2) The Rust tray app.
+  - name: popyachsa-airplay
+    buildsystem: simple
+    build-commands:
+      - cargo build --release --offline --bin popyachsa-airplay
+      - install -Dm755 target/release/popyachsa-airplay /app/bin/popyachsa-airplay
+      - install -Dm644 com.popyachsa.AirPlay.desktop /app/share/applications/com.popyachsa.AirPlay.desktop
+      - install -Dm644 com.popyachsa.AirPlay.png /app/share/icons/hicolor/256x256/apps/com.popyachsa.AirPlay.png
+      - install -Dm644 com.popyachsa.AirPlay.metainfo.xml /app/share/metainfo/com.popyachsa.AirPlay.metainfo.xml
+    sources:
+      # TODO: the app repo + vendored cargo deps for --offline (generate with
+      # flatpak-cargo-generator -> cargo-sources.json, then add it here).
+      - type: dir
+        path: ../../popyachsa-airplay
+      # - cargo-sources.json

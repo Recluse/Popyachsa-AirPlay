@@ -1,0 +1,10 @@
+# Popyachsa AirPlay — Cargo workspace.
+#   app/             the tray + host-window application (the binary)
+#   airplay-lib/     safe Rust wrapper over the engine's C ABI
+#   airplay-lib-sys/ raw FFI + runtime dlopen of uxplay-core.{dll,so,dylib}
+#
+# The engine itself (uxplay-core) is built separately from the third_party/uxplay
+# submodule — see BUILD.md.
+[workspace]
+resolver = "2"
+members = ["app", "airplay-lib", "airplay-lib-sys"]

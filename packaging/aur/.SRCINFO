@@ -1,0 +1,27 @@
+pkgbase = popyachsa-airplay-bin
+	pkgdesc = AirPlay receiver — mirror iPhone, iPad or Mac to your screen (Wi-Fi, low-latency)
+	pkgver = 0.2.7
+	pkgrel = 1
+	url = https://airplay.popyachsa.com
+	arch = x86_64
+	license = GPL-3.0-or-later
+	depends = avahi
+	depends = gtk3
+	depends = gst-libav
+	depends = gst-plugins-base
+	depends = gst-plugins-good
+	depends = gst-plugins-bad
+	depends = libplist
+	depends = openssl
+	depends = libayatana-appindicator
+	depends = xdotool
+	optdepends = gstreamer-vaapi: Intel/AMD hardware H.264/H.265 decode
+	optdepends = intel-media-driver: Intel HW decode (Gen8+)
+	optdepends = libva-mesa-driver: AMD / older-Intel HW decode
+	provides = popyachsa-airplay
+	conflicts = popyachsa-airplay
+	options = !strip
+	source = popyachsa-airplay-0.2.7-x86_64.tar.gz::https://dl.airplay.popyachsa.com/popyachsa-airplay-0.2.7-x86_64.tar.gz
+	sha256sums = 3c745d4105903e05b0010bf9a7185e3fba3e9c1a50b96dffae2ade8cb4e8f365
+
+pkgname = popyachsa-airplay-bin

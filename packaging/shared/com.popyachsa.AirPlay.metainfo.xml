@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- AppStream metainfo (shared by .deb/.rpm/AUR/Flatpak; required by Flathub). -->
+<component type="desktop-application">
+  <id>com.popyachsa.AirPlay</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+
+  <name>Popyachsa AirPlay</name>
+  <summary>AirPlay receiver — mirror iPhone, iPad or Mac to your screen</summary>
+
+  <description>
+    <p>
+      A low-latency AirPlay receiver. Mirror your iPhone, iPad or Mac, or stream
+      video, photos and music, straight to this computer over your local Wi-Fi.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>Low-latency screen mirroring with hardware H.264 / H.265 decode (VA-API or NVDEC)</li>
+      <li>Direct HLS playback for YouTube, Photos, Safari and Apple TV+ video</li>
+      <li>Auto screen-orientation tracking; window adapts to the picture aspect</li>
+      <li>A tiny tray app — 16 languages, no accounts, no telemetry</li>
+    </ul>
+  </description>
+
+  <launchable type="desktop-id">com.popyachsa.AirPlay.desktop</launchable>
+
+  <url type="homepage">https://airplay.popyachsa.com</url>
+  <url type="bugtracker">https://github.com/Recluse/Popyachsa-AirPlay/issues</url>
+  <url type="vcs-browser">https://github.com/Recluse/Popyachsa-AirPlay</url>
+
+  <developer id="com.popyachsa">
+    <name>Recluse</name>
+  </developer>
+
+  <content_rating type="oars-1.1" />
+
+  <screenshots>
+    <!-- TODO(release): host a real screenshot of the receiver showing an iPhone. -->
+    <screenshot type="default">
+      <image>https://airplay.popyachsa.com/assets/screenshot.png</image>
+      <caption>Receiving an iPhone screen</caption>
+    </screenshot>
+  </screenshots>
+
+  <releases>
+    <release version="0.2.7" date="2026-06-19">
+      <description>
+        <p>Cross-platform release: Linux build, settings and self-update.</p>
+      </description>
+    </release>
+  </releases>
+</component>

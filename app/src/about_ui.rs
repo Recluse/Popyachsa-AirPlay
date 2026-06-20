@@ -232,9 +232,9 @@ impl eframe::App for AboutApp {
                         link_row(ui, "Blog",
                                  "recluse.lol",
                                  "https://recluse.lol");
-                        link_row(ui, "GitHub",
-                                 "@Recluse on github.com",
-                                 "https://github.com/Recluse");
+                        link_row(ui, "Source",
+                                 "github.com/Recluse/Popyachsa-AirPlay",
+                                 "https://github.com/Recluse/Popyachsa-AirPlay");
                         link_row(ui, "Email",
                                  "me@recluse.lol",
                                  "mailto:me@recluse.lol");

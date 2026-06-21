@@ -65,15 +65,39 @@ Terminal=false
 EOF
 
 cd "$AI"
+# 1. Populate AppDir (binary + uxplay-core.so deps + GStreamer plugins). No
+#    `--output appimage`: we prune host display libs before packaging.
 "$AI/tools/linuxdeploy.AppImage" --appdir "$APPDIR" \
   -e "$APPDIR/usr/bin/popyachsa-airplay" \
   -l "$APP/target/$PROFILE/uxplay-core.so" \
   -d "$AI/popyachsa-airplay.desktop" \
   -i "$AI/popyachsa-airplay.png" \
-  --plugin gstreamer \
-  --output appimage 2>&1 | tail -45
+  --plugin gstreamer 2>&1 | tail -45
+
+# 2. PRUNE the host display stack (X11 / xcb / xkbcommon / wayland client libs).
+#    These MUST come from the user's system so they match the host's libX11.so.6 /
+#    libxcb.so.1 / X server. linuxdeploy excludes the cores (libX11.so, libxcb.so)
+#    but leaves their companions (libXext, libXrender, libxcb-render/shm/xkb,
+#    libxkbcommon, libwayland-*) built against the BUILD host's libX11/libxcb — on
+#    a user with a different version those are ABI-skewed -> SIGSEGV in X init
+#    (e.g. the egui Settings subprocess crashes on XOpenDisplay). They exist on
+#    every X/Wayland desktop, so dropping them is safe (standard AppImage excludelist).
+echo "=== pruning host display libs from the bundle ==="
+( cd "$APPDIR/usr/lib" 2>/dev/null && rm -fv \
+    libX11.so* libXau.so* libXcomposite.so* libXcursor.so* libXdamage.so* \
+    libXdmcp.so* libXext.so* libXfixes.so* libXi.so* libXinerama.so* \
+    libXrandr.so* libXrender.so* libXss.so* libXtst.so* libXv.so* \
+    libxcb.so* libxcb-*.so* libxkbcommon.so* libxkbcommon-x11.so* libwayland-*.so* \
+    2>/dev/null ) | sed 's/^/  pruned /' || true
+
+# 3. Pack the pruned AppDir + zsync (delta-update info from $UPDATE_INFORMATION).
+ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 "$AI/tools/appimagetool.AppImage" \
+  -u "$UPDATE_INFORMATION" \
+  "$APPDIR" "$AI/Popyachsa_AirPlay-x86_64.AppImage" 2>&1 | tail -20
 
 echo "=== result ==="
+echo "--- residual display libs in AppDir (expect none) ---"
+ls "$APPDIR/usr/lib/" | grep -E "^libX|^libxcb|^libxkbcommon|^libwayland" || echo "  (clean — no host display libs bundled)"
 # Both the AppImage and its zsync control file (publish them together so the
 # delta update can find the .zsync alongside the AppImage).
 ls -la "$AI"/*.AppImage "$AI"/*.zsync 2>&1

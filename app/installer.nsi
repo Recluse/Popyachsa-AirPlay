@@ -9,9 +9,9 @@
 !include "FileFunc.nsh"
 
 !define PRODUCT_NAME         "Popyachsa AirPlay"
-; Overridable from the command line: makensis /DPRODUCT_VERSION=0.2.8 installer.nsi
+; Overridable from the command line: makensis /DPRODUCT_VERSION=0.2.9 installer.nsi
 !ifndef PRODUCT_VERSION
-  !define PRODUCT_VERSION    "0.2.8"
+  !define PRODUCT_VERSION    "0.2.9"
 !endif
 !define PRODUCT_PUBLISHER    "Recluse"
 !define PRODUCT_URL          "https://github.com/Recluse"

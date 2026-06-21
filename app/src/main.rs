@@ -429,6 +429,20 @@ fn main() -> Result<()> {
     #[cfg(target_os = "linux")]
     unsafe { x11::xlib::XInitThreads(); }
 
+    // Pre-set AVAHI_COMPAT_NOWARN so the bundled UxPlay engine SKIPS its own
+    // `putenv("AVAHI_COMPAT_NOWARN=1")` (uxplay.cpp): that putenv stores a pointer
+    // into uxplay-core.so's STATIC data into `environ` — and we dlclose
+    // uxplay-core.so on every engine stop/restart, which unmaps that memory and
+    // leaves a DANGLING `environ` entry. The next getenv() (the restarted engine's
+    // X worker calling XOpenDisplay, or a forked Settings/About child that
+    // inherited the corrupted environ) then walks into freed memory and SIGSEGVs.
+    // It's layout/glibc-dependent (survives by luck on the build distro, fatal on
+    // newer glibc). set_var routes through libc setenv, which COPIES into
+    // libc-owned memory that outlives any dlclose, and the non-null getenv makes
+    // the engine skip its putenv entirely. Must run before the engine ever loads.
+    #[cfg(target_os = "linux")]
+    std::env::set_var("AVAHI_COMPAT_NOWARN", "1");
+
     enable_per_monitor_dpi();
 
     // Sub-windows spawned from the tray each own their own event loop.

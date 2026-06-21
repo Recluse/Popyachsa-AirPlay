@@ -38,8 +38,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetDoubleClickTime, ReleaseCapture, SetFocus, RegisterHotKey, UnregisterHotKey, MOD_ALT,
-    MOD_CONTROL, MOD_NOREPEAT, VK_RETURN,
+    GetDoubleClickTime, GetKeyState, ReleaseCapture, SetFocus, VK_MENU,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
@@ -53,18 +52,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW,
     CW_USEDEFAULT, GWLP_USERDATA, GWL_STYLE, HWND_NOTOPMOST, HWND_TOPMOST, HWND_TOP, IDC_ARROW, MSG,
     SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
-    SW_HIDE, SW_SHOW, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_HOTKEY, WM_TIMER, WNDCLASSW,
+    SW_HIDE, SW_SHOW, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSW,
     WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 
 use crate::config::Config;
 use crate::monitors;
 use crate::status::Status;
-
-const HOTKEY_FULLSCREEN: i32 = 1;
-// AltGr+Enter = Ctrl+Alt+Enter on many layouts (right Alt sends Ctrl+Alt), which
-// MOD_ALT alone won't catch — register it too so either Alt key toggles.
-const HOTKEY_FULLSCREEN_ALTGR: i32 = 2;
 
 // Posted from the log callback (engine thread) to the host-window thread so all
 // window ops stay on the owning thread.
@@ -88,9 +82,12 @@ const MARK_TEARDOWN: &str = "Open connections: 0";
 // no device is connected" regardless of when the sink re-shows.
 const HIDE_TIMER_ID: usize = 1;
 
-// Fullscreen keys handled in the message pump (VK_F = 0x46, VK_ESCAPE = 0x1B).
+// Fullscreen keys handled in the message pump (focus-scoped, so they only fire
+// when our video window has focus). VK_F = 0x46, VK_ESCAPE = 0x1B, VK_RETURN =
+// 0x0D (Alt+Enter arrives as WM_SYSKEYDOWN/VK_RETURN).
 const VK_F: u32 = 0x46;
 const VK_ESC: u32 = 0x1B;
+const VK_ENTER: u32 = 0x0D;
 
 // Shared with the C log callback (engine is single-instance).
 static CB_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -382,8 +379,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
         },
-        // (Alt+Enter / WM_HOTKEY is handled in the pump loop, not here — the
-        // sink subclasses this HWND so WM_HOTKEY may not reach this proc.)
+        // (Alt+Enter is handled in the pump loop, not here — the sink subclasses
+        // this HWND so keystrokes may not reach this proc.)
         // CONSUME WM_CLOSE: just end the pump. We must NOT let DefWindowProc
         // DestroyWindow here — the engine's d3d11videosink is still rendering
         // into this HWND, and destroying it out from under the sink crashes.
@@ -581,12 +578,12 @@ fn run_host_window(cfg: Config, hwnd_out: Arc<AtomicIsize>, running: Arc<AtomicB
             let _ = SetWindowPos(hwnd, None, 0, 0, 0, 0,
                                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
         }
-        // Alt+Enter (left Alt) and AltGr/Ctrl+Alt+Enter (right Alt on many
-        // layouts) both toggle fullscreen.
-        let _ = RegisterHotKey(Some(hwnd), HOTKEY_FULLSCREEN, MOD_ALT | MOD_NOREPEAT, VK_RETURN.0 as u32);
-        let _ = RegisterHotKey(Some(hwnd), HOTKEY_FULLSCREEN_ALTGR,
-                               MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_RETURN.0 as u32);
-        // (fullscreen is applied when the window is shown on connect, not now)
+        // Alt+Enter is NOT a global hotkey: RegisterHotKey grabs it system-wide
+        // for the whole time the engine runs (even with no video window shown),
+        // breaking Alt+Enter everywhere else. It's handled instead as a normal
+        // keystroke in the message pump below, so it only fires when our video
+        // window has focus. (Fullscreen is applied when the window is shown on
+        // connect, not now.)
 
         // Watchdog timer that keeps the window hidden while no device is
         // connected (defeats the sink re-showing it during reconnect re-init).
@@ -616,26 +613,33 @@ fn run_host_window(cfg: Config, hwnd_out: Arc<AtomicIsize>, running: Arc<AtomicB
         // Win32 message pump — runs until WM_CLOSE -> PostQuitMessage.
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            // Handle Alt+Enter HERE, in the pump — NOT in the WndProc. The
-            // d3d11videosink subclasses our HWND, so a WM_HOTKEY dispatched to
-            // the window may never reach our proc. WM_HOTKEY is a thread-queue
-            // message GetMessage returns directly, so we act on it before
-            // DispatchMessageW hands control to the (subclassed) window.
-            if msg.message == WM_HOTKEY {
-                let id = msg.wParam.0 as i32;
-                if id == HOTKEY_FULLSCREEN || id == HOTKEY_FULLSCREEN_ALTGR {
-                    toggle_fullscreen(hwnd, &mut *state);
-                }
+            // Alt+Enter toggles fullscreen — handled HERE, as a normal keystroke
+            // in the pump, NOT via RegisterHotKey (which would steal Alt+Enter
+            // system-wide) and NOT in the WndProc (the d3d11videosink subclasses
+            // our HWND). Plain Alt+Enter (Alt down, Ctrl up) arrives as
+            // WM_SYSKEYDOWN/VK_RETURN. Keyboard input goes only to the focused
+            // window of OUR thread, so this fires only when the video window has
+            // focus. Swallow ONLY VK_RETURN — other Alt-combos (Alt+F4, Alt+Space)
+            // must fall through to DefWindowProc.
+            if msg.message == WM_SYSKEYDOWN && (msg.wParam.0 as u32) == VK_ENTER {
+                toggle_fullscreen(hwnd, &mut *state);
                 continue;
             }
-            // F toggles / Esc exits fullscreen — handled in the pump (keyboard
-            // goes to the focused top-level window, on our thread). NOTE: mouse
-            // double-click can't be caught here: it goes to the GSTD3D11 child
-            // (a GStreamer-owned, cross-thread window), so WM_LBUTTONDBLCLK never
-            // reaches our queue. F / Esc / Alt+Enter cover fullscreen instead.
+            // F toggles / Esc exits fullscreen. Also AltGr+Enter (= Ctrl+Alt+Enter
+            // on many EU layouts): holding Ctrl reclassifies the keystroke as
+            // WM_KEYDOWN (not WM_SYSKEYDOWN), so catch VK_RETURN here too when Alt
+            // is down. All focus-scoped (keyboard goes to our thread's focused
+            // window). Plain Enter (no Alt) falls through untouched. NOTE: mouse
+            // double-click can't be caught here — it goes to the GSTD3D11 child
+            // (GStreamer-owned, cross-thread), so F / Esc / Alt+Enter cover
+            // fullscreen instead.
             if msg.message == WM_KEYDOWN {
                 let vk = msg.wParam.0 as u32;
-                if vk == VK_F || (vk == VK_ESC && (*state).is_fullscreen) {
+                let alt_down = GetKeyState(VK_MENU.0 as i32) < 0;
+                if vk == VK_F
+                    || (vk == VK_ESC && (*state).is_fullscreen)
+                    || (vk == VK_ENTER && alt_down)
+                {
                     toggle_fullscreen(hwnd, &mut *state);
                     continue;
                 }
@@ -683,8 +687,6 @@ fn run_host_window(cfg: Config, hwnd_out: Arc<AtomicIsize>, running: Arc<AtomicB
         CB_HWND.store(0, Ordering::SeqCst);
         CONNECTED.store(false, Ordering::SeqCst);
         let _ = KillTimer(Some(hwnd), HIDE_TIMER_ID);
-        let _ = UnregisterHotKey(Some(hwnd), HOTKEY_FULLSCREEN);
-        let _ = UnregisterHotKey(Some(hwnd), HOTKEY_FULLSCREEN_ALTGR);
         let st = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WinState;
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
         if !st.is_null() {

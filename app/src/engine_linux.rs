@@ -231,6 +231,12 @@ fn run_host_window(cfg: Config, running: Arc<AtomicBool>, stop_flag: Arc<AtomicB
             eprintln!("[engine] start: {e}");
         }
         running.store(true, Ordering::SeqCst);
+        // Engine is up and advertising (no device yet) -> tell the tray to show the
+        // "Ready" state (blue icon). Without this, an autostarted engine leaves the
+        // icon on "Off" (grey) until a device connects, because the only later
+        // status events are Connected (on connect) / Ready (on disconnect) / Off
+        // (on teardown) — the initial Ready transition was never sent.
+        send_status(Status::Ready);
         eprintln!("[engine] X11 host window 0x{xid:x} up; engine started");
 
         // Poll loop: drain X events, map/unmap on connect/disconnect, exit on stop.

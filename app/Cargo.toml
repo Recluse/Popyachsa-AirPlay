@@ -1,6 +1,6 @@
 [package]
 name = "popyachsa-airplay"
-version = "0.2.9"
+version = "0.2.10"
 edition = "2021"
 authors = ["Popyachsa AirPlay contributors"]
 description = "AirPlay receiver for Windows, Linux and macOS — in-process patched-UxPlay engine + tray"

@@ -608,6 +608,11 @@ fn run_host_window(cfg: Config, hwnd_out: Arc<AtomicIsize>, running: Arc<AtomicB
             eprintln!("[engine] start: {e}");
         }
         running.store(true, Ordering::SeqCst);
+        // Engine is up and advertising (no device yet) -> show the "Ready" state in
+        // the tray. Without this, an autostarted engine leaves the icon on "Off"
+        // until a device connects (the only later events are Connected/Ready-on-
+        // disconnect/Off-on-teardown).
+        send_status(Status::Ready);
         eprintln!("[engine] host window {:?} up; engine started", hwnd.0);
 
         // Win32 message pump — runs until WM_CLOSE -> PostQuitMessage.

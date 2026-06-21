@@ -83,11 +83,18 @@ cd "$AI"
 #    (e.g. the egui Settings subprocess crashes on XOpenDisplay). They exist on
 #    every X/Wayland desktop, so dropping them is safe (standard AppImage excludelist).
 echo "=== pruning host display libs from the bundle ==="
+# Also prune the host GPU video-accel CLIENT libs (libva*, libvdpau): like libX11
+# and libpipewire, they must come from the user's system so they match the host's
+# VA/VDPAU DRIVER. A bundled (build-host) libva OLDER than the user's driver fails
+# the libva<->driver ABI check, so the `va` GStreamer plugin registers NO decoders
+# and `-vd vah264dec` dies with "no element". Host libva matches the host driver ->
+# vah264dec/vah265dec register. (Keep libgstva-1.0.so — that's our plugin's lib.)
 ( cd "$APPDIR/usr/lib" 2>/dev/null && rm -fv \
     libX11.so* libXau.so* libXcomposite.so* libXcursor.so* libXdamage.so* \
     libXdmcp.so* libXext.so* libXfixes.so* libXi.so* libXinerama.so* \
     libXrandr.so* libXrender.so* libXss.so* libXtst.so* libXv.so* \
     libxcb.so* libxcb-*.so* libxkbcommon.so* libxkbcommon-x11.so* libwayland-*.so* \
+    libva.so* libva-drm.so* libva-x11.so* libva-glx.so* libvdpau.so* \
     2>/dev/null ) | sed 's/^/  pruned /' || true
 
 # 3. Pack the pruned AppDir + zsync (delta-update info from $UPDATE_INFORMATION).

@@ -82,7 +82,8 @@ fn core_so_path() -> String {
 }
 
 /// UxPlay option tail for Linux v1 (software path; HW decode = L5 selector).
-fn build_options(cfg: &Config) -> String {
+/// `xv_available` (the X11 XVideo extension) selects the video sink.
+fn build_options(cfg: &Config, xv_available: bool) -> String {
     let mut a: Vec<String> = Vec::new();
     if cfg.debug_logging {
         a.push("-d".into());
@@ -94,9 +95,14 @@ fn build_options(cfg: &Config) -> String {
     // h265 RECONNECT (video_renderer.c::video_renderer_listen) -> SIGABRT. h264 is
     // robust; re-enabling h265 waits on the reconnect-lifecycle fix.
     let _ = cfg.enable_h265;
-    // Video sink: ximagesink (software X11, robust on every box incl. WSL).
-    // glimagesink + HW zero-copy is a follow-up (L5).
-    a.extend(["-vs".into(), "ximagesink".into()]);
+    // Video sink: prefer xvimagesink — it scales in the X11 XVideo hardware
+    // overlay (sharper, off-CPU) instead of ximagesink's CPU bilinear path. That
+    // matters on a HiDPI panel where a modest AirPlay source is scaled up (the
+    // reported "blurry window"). Same GstVideoOverlay XID interface, so
+    // set_window(xid) is unchanged. Fall back to ximagesink where XVideo is absent
+    // (headless / WSL / many remote-X / Xwayland) — the robust software path.
+    let video_sink = if xv_available { "xvimagesink" } else { "ximagesink" };
+    a.extend(["-vs".into(), video_sink.into()]);
     // Decoder (from Settings, Linux values): auto = uxplay's decodebin (HW if
     // available, software fallback — the robust default); software = avdec;
     // vaapi = vah264dec (Intel/AMD); nvidia = nvh264dec.
@@ -188,6 +194,28 @@ fn run_host_window(cfg: Config, running: Arc<AtomicBool>, stop_flag: Arc<AtomicB
         let black = xlib::XBlackPixel(display, screen);
         let window = xlib::XCreateSimpleWindow(display, root, 0, 0, 1280, 720, 0, black, black);
 
+        // Probe the X11 XVideo extension -> pick xvimagesink (sharper HiDPI scaling)
+        // when present, else ximagesink. Also log the screen size + KDE/Xft scale,
+        // for diagnosing blurry-window reports on fractionally-scaled (e.g. 1.5x)
+        // displays. (KDE writes Xft.dpi=144 for 1.5x on X11; under Xwayland the
+        // compositor upscales the X buffer and there is no X11 opt-out — a native
+        // Wayland sink is the eventual fix there.)
+        let (mut xvo, mut xve, mut xver) = (0, 0, 0);
+        let xv_available = xlib::XQueryExtension(
+            display, b"XVideo\0".as_ptr() as *const c_char, &mut xvo, &mut xve, &mut xver) != 0;
+        let dpi = {
+            let rms = xlib::XResourceManagerString(display);
+            if rms.is_null() { String::new() } else {
+                CStr::from_ptr(rms).to_string_lossy()
+                    .lines().find(|l| l.starts_with("Xft.dpi"))
+                    .map(|l| l.trim().to_string()).unwrap_or_default()
+            }
+        };
+        eprintln!("[engine] X11 screen {}x{}, XVideo={} (sink={}), {}",
+            xlib::XDisplayWidth(display, screen), xlib::XDisplayHeight(display, screen),
+            xv_available, if xv_available { "xvimagesink" } else { "ximagesink" },
+            if dpi.is_empty() { "Xft.dpi=unset".into() } else { dpi });
+
         let title = CString::new("Popyachsa AirPlay").unwrap();
         xlib::XStoreName(display, window, title.as_ptr());
 
@@ -223,7 +251,7 @@ fn run_host_window(cfg: Config, running: Arc<AtomicBool>, stop_flag: Arc<AtomicB
         ap.set_log_callback(engine_log_cb, std::ptr::null_mut());
         let _ = ap.set_device_name(&cfg.device_name);
         let _ = ap.set_window(xid as *mut c_void); // XID -> GstVideoOverlay
-        let _ = ap.set_options(&build_options(&cfg));
+        let _ = ap.set_options(&build_options(&cfg, xv_available));
         // Open the callback gate just before start so connect markers emitted during
         // startup are honored; it is closed again at teardown before stop/destroy.
         ENGINE_ACTIVE.store(true, Ordering::SeqCst);
@@ -287,7 +315,13 @@ fn run_host_window(cfg: Config, running: Arc<AtomicBool>, stop_flag: Arc<AtomicB
                         let sh = xlib::XDisplayHeight(display, screen) as i64;
                         let maxw = (sw * 85 / 100).max(160);
                         let maxh = (sh * 85 / 100).max(120);
-                        let mut w = maxw;
+                        // Present at the SOURCE size, only shrinking to fit ~85% of
+                        // the screen — never UPscale past native. Blowing a modest
+                        // AirPlay source up to fill a HiDPI panel is what made the
+                        // window look soft; at 1:1 (or smaller) each source pixel maps
+                        // to >=1 screen pixel, so it stays crisp. xvimagesink still
+                        // gives a clean hardware downscale when a clamp is needed.
+                        let mut w = vw.min(maxw);
                         let mut h = w * vh / vw;
                         if h > maxh {
                             h = maxh;

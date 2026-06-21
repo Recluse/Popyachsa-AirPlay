@@ -52,8 +52,14 @@ cargo build --release                 # -> target/release/popyachsa-airplay.exe 
 ```powershell
 .\make-dist.ps1                       # bundles exe + updater + uxplay-core.dll + dnssd.dll
                                        # + the GStreamer runtime/plugins -> dist\ + dist\PopyachsaAirPlay.zip
-makensis /DPRODUCT_VERSION=X.Y.Z installer.nsi   # -> PopyachsaAirPlay-Setup.exe
+cd installer
+makensis /DVERSION=X.Y.Z popyachsa-airplay.nsi   # -> ..\dist\PopyachsaAirPlay-Setup.exe
 ```
+The installer is **per-user** (`%LocalAppData%`, no administrator rights) — this is
+required: the in-app auto-updater writes into the install dir without elevation, so a
+Program Files install would break self-update. `popyachsa-airplay.nsi` enforces this
+(it refuses a Program Files target).
+
 The only non-obvious step is the GStreamer bundle: `make-dist.ps1` walks the DLL
 import graph from `uxplay-core.dll` + every plugin and copies the closure, so the
 zip runs on a machine with no MSYS2/GStreamer installed.

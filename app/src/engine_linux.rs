@@ -16,7 +16,7 @@
 //! glimagesink is the L5 selector. Fullscreen/borderless/aspect = later polish.
 
 use std::ffi::{c_void, CStr, CString};
-use std::os::raw::{c_char, c_int, c_ulong};
+use std::os::raw::{c_char, c_int, c_long, c_uint, c_ulong};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
@@ -81,9 +81,63 @@ fn core_so_path() -> String {
     "uxplay-core.so".to_string()
 }
 
+// --- XVideo port query (libXv) -------------------------------------------------
+// The sink choice is xvimagesink (XVideo hardware overlay — scales + colour-converts
+// in the GPU, so 4K HEVC renders smoothly off-CPU) vs ximagesink (software XShm
+// PutImage — fine for 1080p, but CPU-blits every 4K frame and stutters). Each
+// xvimagesink instance grabs one XVideo "port"; the h265 path builds TWO video sinks
+// at once (h264 + h265 renderers), so it needs >= 2 ports. GPU drivers usually expose
+// ~16; some emulated/minimal X servers (e.g. WSLg) expose 1, where the 2nd xvimagesink
+// can't get a port and that renderer fails to init. So we COUNT the real ports and
+// fall back to ximagesink only when there genuinely aren't enough (logged) — instead
+// of guessing by environment.
+#[repr(C)]
+struct XvAdaptorInfo {
+    base_id: c_ulong,
+    num_ports: c_ulong,
+    type_: c_char,
+    name: *mut c_char,
+    num_formats: c_ulong,
+    formats: *mut c_void, // XvFormat*
+    num_adaptors: c_ulong,
+}
+#[link(name = "Xv")]
+extern "C" {
+    fn XvQueryAdaptors(
+        display: *mut xlib::Display,
+        window: xlib::Window,
+        num_adaptors: *mut c_uint,
+        adaptor_info: *mut *mut XvAdaptorInfo,
+    ) -> c_int;
+    fn XvFreeAdaptorInfo(adaptor_info: *mut XvAdaptorInfo);
+}
+
+/// Total XVideo ports on image-input adaptors — i.e. ports an `xvimagesink` can grab
+/// (`XvShmPutImage` = image data input to the screen). Returns 0 on any error / no
+/// XVideo, which the caller treats as "use ximagesink".
+unsafe fn xv_image_ports(display: *mut xlib::Display, window: xlib::Window) -> u32 {
+    const XV_INPUT_IMAGE: u8 = 0x01 | 0x10; // XvInputMask (1<<XvInput) | XvImageMask
+    let mut n: c_uint = 0;
+    let mut adaptors: *mut XvAdaptorInfo = std::ptr::null_mut();
+    // XvQueryAdaptors returns Success (0) on success.
+    if XvQueryAdaptors(display, window, &mut n, &mut adaptors) != 0 || adaptors.is_null() {
+        return 0;
+    }
+    let mut ports: u64 = 0;
+    for i in 0..n as isize {
+        let a = &*adaptors.offset(i);
+        if (a.type_ as u8 & XV_INPUT_IMAGE) == XV_INPUT_IMAGE {
+            ports += a.num_ports as u64;
+        }
+    }
+    XvFreeAdaptorInfo(adaptors);
+    ports.min(u64::from(u16::MAX)) as u32
+}
+
 /// UxPlay option tail for Linux v1 (software path; HW decode = L5 selector).
-/// `xv_available` (the X11 XVideo extension) selects the video sink.
-fn build_options(cfg: &Config, xv_available: bool) -> String {
+/// `video_sink` is the GStreamer sink the caller picked from the real XVideo port
+/// count (see `xv_image_ports`): xvimagesink on hardware with enough ports, else ximagesink.
+fn build_options(cfg: &Config, video_sink: &str) -> String {
     let mut a: Vec<String> = Vec::new();
     if cfg.debug_logging {
         a.push("-d".into());
@@ -91,17 +145,17 @@ fn build_options(cfg: &Config, xv_available: bool) -> String {
     a.extend(["-nh", "-nohold", "-nc"].iter().map(|s| s.to_string()));
     a.extend(["-fps".into(), cfg.target_fps.to_string()]);
     a.extend(["-vsync".into(), "no".into()]);
-    // h265 is OFF on Linux v1: this UxPlay fork hits a renderer-bus assertion on
-    // h265 RECONNECT (video_renderer.c::video_renderer_listen) -> SIGABRT. h264 is
-    // robust; re-enabling h265 waits on the reconnect-lifecycle fix.
-    let _ = cfg.enable_h265;
-    // Video sink: prefer xvimagesink — it scales in the X11 XVideo hardware
-    // overlay (sharper, off-CPU) instead of ximagesink's CPU bilinear path. That
-    // matters on a HiDPI panel where a modest AirPlay source is scaled up (the
-    // reported "blurry window"). Same GstVideoOverlay XID interface, so
-    // set_window(xid) is unchanged. Fall back to ximagesink where XVideo is absent
-    // (headless / WSL / many remote-X / Xwayland) — the robust software path.
-    let video_sink = if xv_available { "xvimagesink" } else { "ximagesink" };
+    // h265 (HEVC) — this is what unlocks 4K: UxPlay advertises 3840x2160 only when
+    // -h265 is on (uxplay.cpp gates the display size on h265_support); h264-only caps
+    // the receiver at 1920x1080. h265 was OFF on Linux because this fork SIGABRT'd on
+    // h265 RECONNECT — fixed in the fork's renderer reconnect lifecycle: mirror video
+    // now always rebuilds the renderers fresh on reconnect (no NULL/dangling
+    // renderer_type[] slot from codec-select), and the mirror RTP thread is joined
+    // before the rebuild arms (no cross-thread UAF on renderer_type[]).
+    if cfg.enable_h265 {
+        a.push("-h265".into());
+    }
+    // Video sink chosen by the caller from the real XVideo port count.
     a.extend(["-vs".into(), video_sink.into()]);
     // Decoder (from Settings, Linux values): auto = uxplay's decodebin (HW if
     // available, software fallback — the robust default); software = avdec;
@@ -155,7 +209,7 @@ extern "C" fn engine_log_cb(_level: c_int, msg: *const c_char, _user: *mut c_voi
     // it is LOGGER_INFO (so it reaches this callback WITHOUT -d), is
     // codec-independent (raop_rtp_mirror, not the renderer), and re-fires on
     // rotation. The alternatives don't work for us: "begin video stream wxh" is
-    // DEBUG-only, and "video format is ... video WxH" is h265-only (we run h264).
+    // DEBUG-only, and "video format is ... video WxH" is per-codec.
     if text.contains("display dimensions:") {
         // The " w=" / " h=" tokens carry the final display size; take the digits
         // right after each.
@@ -177,6 +231,36 @@ extern "C" fn engine_log_cb(_level: c_int, msg: *const c_char, _user: *mut c_voi
         }
     }
     })); // end catch_unwind
+}
+
+/// Ask the window manager to add/remove `_NET_WM_STATE_FULLSCREEN` on the host window
+/// (EWMH). Standard WMs (KDE/GNOME/Xfwm/wlroots…) honour this; the xvimagesink overlay
+/// then fills the fullscreen window and XVideo scales the frame to it. No-op without a
+/// conforming WM (the window just stays at its fitted size — graceful).
+unsafe fn request_fullscreen(display: *mut xlib::Display, window: xlib::Window, on: bool) {
+    let net_wm_state =
+        xlib::XInternAtom(display, b"_NET_WM_STATE\0".as_ptr() as *const c_char, 0);
+    let fullscreen =
+        xlib::XInternAtom(display, b"_NET_WM_STATE_FULLSCREEN\0".as_ptr() as *const c_char, 0);
+    if net_wm_state == 0 || fullscreen == 0 {
+        return;
+    }
+    let root = xlib::XDefaultRootWindow(display);
+    let mut cm: xlib::XClientMessageEvent = std::mem::zeroed();
+    cm.type_ = xlib::ClientMessage;
+    cm.window = window;
+    cm.message_type = net_wm_state;
+    cm.format = 32;
+    cm.data.set_long(0, if on { 1 } else { 0 }); // 1 = _NET_WM_STATE_ADD, 0 = _REMOVE
+    cm.data.set_long(1, fullscreen as c_long);
+    cm.data.set_long(3, 1); // source indication: normal application
+    let mut ev = xlib::XEvent { client_message: cm };
+    xlib::XSendEvent(
+        display, root, 0,
+        xlib::SubstructureRedirectMask | xlib::SubstructureNotifyMask,
+        &mut ev,
+    );
+    xlib::XFlush(display);
 }
 
 /// Body of the host-window thread: create an X11 window, hand its XID to the
@@ -211,9 +295,22 @@ fn run_host_window(cfg: Config, running: Arc<AtomicBool>, stop_flag: Arc<AtomicB
                     .map(|l| l.trim().to_string()).unwrap_or_default()
             }
         };
-        eprintln!("[engine] X11 screen {}x{}, XVideo={} (sink={}), {}",
+        // Pick the video sink from the REAL XVideo port count: xvimagesink (hardware
+        // overlay, smooth 4K) needs one port per renderer, and the h265 path runs two
+        // sinks (h264 + h265) at once. Fall back to software ximagesink — loudly — when
+        // there genuinely aren't enough ports (e.g. WSLg's single-port emulated XVideo).
+        let xv_ports = if xv_available { xv_image_ports(display, window) } else { 0 };
+        let needed_ports = 1 + u32::from(cfg.enable_h265); // (+coverart, off on Linux)
+        let use_xv = xv_available && xv_ports >= needed_ports;
+        let video_sink: &str = if use_xv { "xvimagesink" } else { "ximagesink" };
+        if xv_available && !use_xv {
+            eprintln!("[engine] XVideo: {} image port(s) available, need {} for the \
+                       h264+h265 renderers -> falling back to software ximagesink \
+                       (4K may stutter)", xv_ports, needed_ports);
+        }
+        eprintln!("[engine] X11 screen {}x{}, XVideo={} ({} ports, sink={}), {}",
             xlib::XDisplayWidth(display, screen), xlib::XDisplayHeight(display, screen),
-            xv_available, if xv_available { "xvimagesink" } else { "ximagesink" },
+            xv_available, xv_ports, video_sink,
             if dpi.is_empty() { "Xft.dpi=unset".into() } else { dpi });
 
         let title = CString::new("Popyachsa AirPlay").unwrap();
@@ -226,7 +323,7 @@ fn run_host_window(cfg: Config, running: Arc<AtomicBool>, stop_flag: Arc<AtomicB
         let mut wm_delete =
             xlib::XInternAtom(display, b"WM_DELETE_WINDOW\0".as_ptr() as *const c_char, 0);
         xlib::XSetWMProtocols(display, window, &mut wm_delete, 1);
-        xlib::XSelectInput(display, window, xlib::StructureNotifyMask);
+        xlib::XSelectInput(display, window, xlib::StructureNotifyMask | xlib::KeyPressMask);
         // Created HIDDEN (not mapped): the engine just advertises; the window is
         // shown only when a device actually connects.
         xlib::XFlush(display);
@@ -251,7 +348,7 @@ fn run_host_window(cfg: Config, running: Arc<AtomicBool>, stop_flag: Arc<AtomicB
         ap.set_log_callback(engine_log_cb, std::ptr::null_mut());
         let _ = ap.set_device_name(&cfg.device_name);
         let _ = ap.set_window(xid as *mut c_void); // XID -> GstVideoOverlay
-        let _ = ap.set_options(&build_options(&cfg, xv_available));
+        let _ = ap.set_options(&build_options(&cfg, video_sink));
         // Open the callback gate just before start so connect markers emitted during
         // startup are honored; it is closed again at teardown before stop/destroy.
         ENGINE_ACTIVE.store(true, Ordering::SeqCst);
@@ -269,6 +366,9 @@ fn run_host_window(cfg: Config, running: Arc<AtomicBool>, stop_flag: Arc<AtomicB
 
         // Poll loop: drain X events, map/unmap on connect/disconnect, exit on stop.
         let mut mapped = false;
+        // Fullscreen state (default from config; Alt+Enter toggles, Esc exits). When
+        // fullscreen, the WM owns the window size, so the aspect-fit resize is skipped.
+        let mut is_fullscreen = cfg.fullscreen;
         loop {
             if stop_flag.load(Ordering::SeqCst) {
                 break;
@@ -283,6 +383,21 @@ fn run_host_window(cfg: Config, running: Arc<AtomicBool>, stop_flag: Arc<AtomicB
                     {
                         stop_flag.store(true, Ordering::SeqCst);
                     }
+                } else if ev.get_type() == xlib::KeyPress {
+                    // Alt+Enter toggles fullscreen; Esc leaves it (parity with Windows).
+                    const XK_RETURN: xlib::KeySym = 0xff0d;
+                    const XK_ESCAPE: xlib::KeySym = 0xff1b;
+                    let mut ke = ev.key;
+                    let keysym = xlib::XLookupKeysym(&mut ke, 0);
+                    let alt = (ke.state & xlib::Mod1Mask) != 0;
+                    if (keysym == XK_RETURN && alt) || (keysym == XK_ESCAPE && is_fullscreen) {
+                        is_fullscreen = if keysym == XK_ESCAPE { false } else { !is_fullscreen };
+                        request_fullscreen(display, window, is_fullscreen);
+                        if !is_fullscreen {
+                            // Force the aspect-fit resize to re-run next iteration.
+                            last_resize = last_resize.wrapping_sub(1);
+                        }
+                    }
                 }
             }
             let g = CONN_GEN.load(Ordering::SeqCst);
@@ -293,6 +408,9 @@ fn run_host_window(cfg: Config, running: Arc<AtomicBool>, stop_flag: Arc<AtomicB
                     xlib::XMapWindow(display, window);
                     xlib::XFlush(display);
                     mapped = true;
+                    if is_fullscreen {
+                        request_fullscreen(display, window, true);
+                    }
                     send_status(Status::Connected);
                 } else if !connected && mapped {
                     xlib::XUnmapWindow(display, window);
@@ -307,7 +425,7 @@ fn run_host_window(cfg: Config, running: Arc<AtomicBool>, stop_flag: Arc<AtomicB
             if rg != last_resize {
                 last_resize = rg;
                 let packed = VIDEO_WH.load(Ordering::SeqCst);
-                if packed != 0 {
+                if packed != 0 && !is_fullscreen {
                     let vw = (packed >> 32) as i64;
                     let vh = (packed & 0xffff_ffff) as i64;
                     if vw > 0 && vh > 0 {
@@ -315,12 +433,11 @@ fn run_host_window(cfg: Config, running: Arc<AtomicBool>, stop_flag: Arc<AtomicB
                         let sh = xlib::XDisplayHeight(display, screen) as i64;
                         let maxw = (sw * 85 / 100).max(160);
                         let maxh = (sh * 85 / 100).max(120);
-                        // Present at the SOURCE size, only shrinking to fit ~85% of
-                        // the screen — never UPscale past native. Blowing a modest
-                        // AirPlay source up to fill a HiDPI panel is what made the
-                        // window look soft; at 1:1 (or smaller) each source pixel maps
-                        // to >=1 screen pixel, so it stays crisp. xvimagesink still
-                        // gives a clean hardware downscale when a clamp is needed.
+                        // Present the source at (near) its NATIVE pixel size, only
+                        // SHRINKING to fit ~85% of the screen — never blowing a modest
+                        // ~720p mirror up to a huge window. That upscale is the HiDPI
+                        // blur: video is fixed-pixel content, so enlarging past native
+                        // always interpolates (mpv's hidpi-window-scale=no rationale).
                         let mut w = vw.min(maxw);
                         let mut h = w * vh / vw;
                         if h > maxh {

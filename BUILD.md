@@ -72,7 +72,7 @@ zip runs on a machine with no MSYS2/GStreamer installed.
 ```bash
 sudo apt install build-essential cmake ninja-build pkg-config \
   libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libavahi-compat-libdnssd-dev \
-  libssl-dev libplist-dev libx11-dev libgtk-3-dev
+  libssl-dev libplist-dev libx11-dev libxv-dev libgtk-3-dev
 # runtime: gstreamer1.0-plugins-{base,good,bad}, gstreamer1.0-libav, avahi-daemon
 ```
 mDNS is the system **Avahi** — no shim needed.

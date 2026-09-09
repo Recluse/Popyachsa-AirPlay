@@ -50,8 +50,14 @@ impl Lang {
     /// Russian-region machine with an English UI must get English). English
     /// fallback. Uses the primary-language part of the UI LANGID.
     pub fn detect() -> Lang {
+        Lang::detect_from(os_ui_primary_lang())
+    }
+
+    /// The LANGID -> Lang table, split from [`detect`] so the non-Windows locale
+    /// mapping can be checked against it without touching the environment.
+    fn detect_from(langid: u16) -> Lang {
         use Lang::*;
-        match os_ui_primary_lang() & 0x3ff {
+        match langid & 0x3ff {
             0x09 => En, 0x19 => Ru, 0x22 => Uk, 0x07 => De, 0x0c => Fr, 0x0a => Es,
             0x10 => It, 0x16 => PtBr, 0x15 => Pl, 0x13 => Nl, 0x1f => Tr, 0x04 => ZhCn,
             0x11 => Ja, 0x12 => Ko, 0x01 => Ar, 0x39 => Hi,
@@ -68,7 +74,51 @@ fn os_ui_primary_lang() -> u16 {
     unsafe { GetUserDefaultUILanguage() }
 }
 #[cfg(not(windows))]
-fn os_ui_primary_lang() -> u16 { 0x09 }
+fn os_ui_primary_lang() -> u16 {
+    // No portable "UI display language" off Windows, so use what every POSIX
+    // toolkit uses: the locale env, in glibc's precedence order. We map the
+    // two-letter prefix back onto the Windows LANGIDs rather than onto `Lang`
+    // so `detect()` stays the single decision table.
+    // ponytail: a Finder-launched .app inherits no LANG — read AppleLanguages
+    // via CFPreferences if macOS auto-detect ever needs to work outside a shell.
+    let v = ["LC_ALL", "LC_MESSAGES", "LANG"]
+        .iter()
+        .find_map(|k| std::env::var(k).ok().filter(|s| !s.is_empty()))
+        .unwrap_or_default();
+    langid_from_locale(&v)
+}
+
+/// `"ru_RU.UTF-8"` -> the Windows LANGID for Russian. Unset, `"C"`/`"POSIX"`, or a
+/// language we don't ship returns 0x09 (English) — byte for byte the behaviour
+/// this branch had when it was a hardcoded constant. Split out from the env read
+/// so it is testable without mutating process-global state.
+#[cfg(not(windows))]
+fn langid_from_locale(locale: &str) -> u16 {
+    // `get` (not slicing) so a 1-char or multi-byte value can't panic.
+    match locale.get(..2).unwrap_or("").to_ascii_lowercase().as_str() {
+        "ru" => 0x19, "uk" => 0x22, "de" => 0x07, "fr" => 0x0c, "es" => 0x0a,
+        "it" => 0x10, "pt" => 0x16, "pl" => 0x15, "nl" => 0x13, "tr" => 0x1f,
+        "zh" => 0x04, "ja" => 0x11, "ko" => 0x12, "ar" => 0x01, "hi" => 0x39,
+        _ => 0x09,
+    }
+}
+
+#[cfg(all(test, not(windows)))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn locale_maps_to_lang() {
+        // The whole point of the fix: a Russian desktop must not get English.
+        assert_eq!(Lang::detect_from(langid_from_locale("ru_RU.UTF-8")), Lang::Ru);
+        assert_eq!(Lang::detect_from(langid_from_locale("pt_BR")), Lang::PtBr);
+        assert_eq!(Lang::detect_from(langid_from_locale("zh-Hans")), Lang::ZhCn);
+        // Fallbacks that must stay English, including the panic bait.
+        for s in ["", "C", "POSIX", "eo_XX", "日本"] {
+            assert_eq!(Lang::detect_from(langid_from_locale(s)), Lang::En, "{s}");
+        }
+    }
+}
 
 /// Operational UI strings. Add a field here + fill it in every `const` below.
 // Some strings are platform-specific (e.g. the Windows-only update/h265/chrome
@@ -106,6 +156,7 @@ pub struct Strings {
     pub lbl_audio_renderer: &'static str,
     pub lbl_fps: &'static str,
     pub lbl_display: &'static str,
+    pub lbl_network: &'static str,
     pub lbl_debug: &'static str,
     // buttons
     pub save: &'static str,
@@ -120,6 +171,7 @@ pub struct Strings {
     pub help_language: &'static str,
     pub help_device_name: &'static str,
     pub help_display: &'static str,
+    pub help_network: &'static str,
     pub help_start_with_windows: &'static str,
     pub help_autostart_launch: &'static str,
     pub help_fullscreen: &'static str,
@@ -145,6 +197,16 @@ pub struct Strings {
     pub upd_install: &'static str,
     pub upd_uptodate: &'static str,
     pub upd_failed: &'static str,
+    // engine start failures
+    pub lbl_notify_errors: &'static str,
+    pub help_notify_errors: &'static str,
+    pub err_engine_title: &'static str,
+    pub err_engine_body: &'static str,
+    /// `{ip}` is substituted at call time, NOT concatenated: the address sits in a
+    /// different place in an Arabic or Japanese sentence than in an English one.
+    pub err_engine_bind: &'static str,
+    /// Tray menu status line only, appended after "ready" — keep it to a few words.
+    pub warn_pin_ignored: &'static str,
 }
 
 /// Resolve the string table for a language (English fallback for the languages
@@ -171,12 +233,14 @@ const EN: Strings = Strings {
     lbl_borderless: "Borderless window", lbl_h265: "Enable H.265 / HEVC mirroring",
     lbl_decoder: "Hardware decoder", lbl_audio_renderer: "Audio Renderer",
     lbl_fps: "Target framerate", lbl_display: "Display", lbl_debug: "Verbose debug logging",
+    lbl_network: "Network adapter",
     save: "Save", cancel: "Cancel",
     about_what: "What it is", about_builton: "Built on",
     about_contact: "Author / contact", about_license: "License", close: "Close",
     help_language: "UI language. Auto = follow the system language.",
     help_device_name: "Shown in the AirPlay picker on your iPhone, iPad or Mac.",
     help_display: "Which monitor the video window opens on.",
+    help_network: "Which adapter the receiver listens on. Automatic = all of them.",
     help_start_with_windows: "Adds an entry to HKCU\\…\\Run.",
     help_autostart_launch: "Start advertising as soon as the tray app launches. The video window stays hidden until a device connects.",
     help_fullscreen: "The video window opens fullscreen when a device connects. Toggle anytime with Alt+Enter / F / double-click (Esc exits).",
@@ -200,6 +264,12 @@ const EN: Strings = Strings {
     upd_install: "Download and install it now?",
     upd_uptodate: "You already have the latest version.",
     upd_failed: "Could not check for updates. Check your connection and try again.",
+    lbl_notify_errors: "Notify me if the receiver fails to start",
+    help_notify_errors: "Shows a desktop notification when the AirPlay receiver cannot start. The reason goes to the log either way.",
+    err_engine_title: "Receiver did not start",
+    err_engine_body: "The AirPlay receiver could not start. Open the log folder from the tray menu for details.",
+    err_engine_bind: "The AirPlay receiver could not start on the selected network adapter ({ip}). Set it back to Automatic in Settings.",
+    warn_pin_ignored: "adapter unavailable — listening on all",
 };
 
 const RU: Strings = Strings {
@@ -216,6 +286,7 @@ const RU: Strings = Strings {
     lbl_borderless: "Окно без рамки", lbl_h265: "Включить зеркалирование H.265 / HEVC",
     lbl_decoder: "Аппаратный декодер", lbl_audio_renderer: "Вывод звука",
     lbl_fps: "Целевая частота кадров", lbl_display: "Дисплей",
+    lbl_network: "Сетевой адаптер",
     lbl_debug: "Подробный лог отладки",
     save: "Сохранить", cancel: "Отмена",
     about_what: "Что это", about_builton: "Построено на",
@@ -223,6 +294,7 @@ const RU: Strings = Strings {
     help_language: "Язык интерфейса. Auto = как в системе.",
     help_device_name: "Отображается в списке AirPlay на iPhone, iPad и Mac.",
     help_display: "На каком мониторе открывается окно видео.",
+    help_network: "На каком адаптере ресивер слушает. Автоматически — на всех.",
     help_start_with_windows: "Добавляет запись в HKCU\\…\\Run.",
     help_autostart_launch: "Начинать вещание сразу при запуске приложения в трее. Окно видео остаётся скрытым, пока не подключится устройство.",
     help_fullscreen: "Окно видео открывается на весь экран при подключении устройства. Переключение в любой момент: Alt+Enter / F / двойной клик (Esc — выход).",
@@ -246,6 +318,12 @@ const RU: Strings = Strings {
     upd_install: "Скачать и установить сейчас?",
     upd_uptodate: "У тебя уже последняя версия.",
     upd_failed: "Не удалось проверить обновления. Проверь соединение и попробуй ещё раз.",
+    lbl_notify_errors: "Уведомлять, если приёмник не запустился",
+    help_notify_errors: "Показывает уведомление, когда приёмник AirPlay не смог запуститься. Причина в любом случае пишется в лог.",
+    err_engine_title: "Приёмник не запустился",
+    err_engine_body: "Приёмник AirPlay не смог запуститься. Причина — в папке логов, она открывается из меню в трее.",
+    err_engine_bind: "Приёмник AirPlay не смог запуститься на выбранном сетевом адаптере ({ip}). Верните значение «Автоматически» в настройках.",
+    warn_pin_ignored: "адаптер недоступен — слушаем все",
 };
 
 const UK: Strings = Strings {
@@ -261,11 +339,13 @@ const UK: Strings = Strings {
     lbl_borderless: "Вікно без рамки", lbl_h265: "Увімкнути дзеркалювання H.265 / HEVC",
     lbl_decoder: "Апаратний декодер", lbl_audio_renderer: "Виведення звуку",
     lbl_fps: "Цільова частота кадрів", lbl_display: "Дисплей", lbl_debug: "Докладний журнал налагодження",
+    lbl_network: "Мережевий адаптер",
     save: "Зберегти", cancel: "Скасувати",
     about_what: "Що це", about_builton: "Побудовано на", about_contact: "Автор / контакти", about_license: "Ліцензія", close: "Закрити",
     help_language: "Мова інтерфейсу. Auto = як у системі.",
     help_device_name: "Відображається у списку AirPlay на iPhone, iPad і Mac.",
     help_display: "На якому моніторі відкривається вікно відео.",
+    help_network: "На якому адаптері приймач слухає. Автоматично — на всіх.",
     help_start_with_windows: "Додає запис у HKCU\\…\\Run.",
     help_autostart_launch: "Починати мовлення одразу після запуску застосунку в треї. Вікно відео лишається прихованим, доки не підключиться пристрій.",
     help_fullscreen: "Вікно відео відкривається на весь екран під час підключення пристрою. Перемикання будь-коли: Alt+Enter / F / подвійний клік (Esc — вихід).",
@@ -289,6 +369,12 @@ const UK: Strings = Strings {
     upd_install: "Завантажити та встановити зараз?",
     upd_uptodate: "У тебе вже найновіша версія.",
     upd_failed: "Не вдалося перевірити оновлення. Перевір з’єднання та спробуй ще раз.",
+    lbl_notify_errors: "Сповіщати, якщо приймач не запустився",
+    help_notify_errors: "Показує сповіщення, коли приймач AirPlay не зміг запуститися. Причина в будь-якому разі пишеться в лог.",
+    err_engine_title: "Приймач не запустився",
+    err_engine_body: "Приймач AirPlay не зміг запуститися. Причина — у теці логів, вона відкривається з меню в треї.",
+    err_engine_bind: "Приймач AirPlay не зміг запуститися на вибраному мережевому адаптері ({ip}). Поверніть значення «Автоматично» в налаштуваннях.",
+    warn_pin_ignored: "адаптер недоступний — слухаємо всі",
 };
 const DE: Strings = Strings {
     status_off: "aus", status_ready: "bereit", status_connected: "verbunden",
@@ -303,11 +389,13 @@ const DE: Strings = Strings {
     lbl_borderless: "Rahmenloses Fenster", lbl_h265: "H.265 / HEVC-Spiegelung aktivieren",
     lbl_decoder: "Hardware-Decoder", lbl_audio_renderer: "Audioausgabe",
     lbl_fps: "Ziel-Bildrate", lbl_display: "Anzeige", lbl_debug: "Ausführliche Debug-Protokollierung",
+    lbl_network: "Netzwerkadapter",
     save: "Speichern", cancel: "Abbrechen",
     about_what: "Was es ist", about_builton: "Basiert auf", about_contact: "Autor / Kontakt", about_license: "Lizenz", close: "Schließen",
     help_language: "Sprache der Oberfläche. Auto = wie im System.",
     help_device_name: "Wird in der AirPlay-Auswahl auf iPhone, iPad oder Mac angezeigt.",
     help_display: "Auf welchem Monitor sich das Videofenster öffnet.",
+    help_network: "Auf welchem Adapter der Empfänger lauscht. Automatisch = auf allen.",
     help_start_with_windows: "Fügt einen Eintrag in HKCU\\…\\Run hinzu.",
     help_autostart_launch: "Beginnt mit der Übertragung, sobald die Tray-App startet. Das Videofenster bleibt verborgen, bis sich ein Gerät verbindet.",
     help_fullscreen: "Das Videofenster öffnet sich beim Verbinden eines Geräts im Vollbild. Jederzeit umschaltbar mit Alt+Enter / F / Doppelklick (Esc beendet).",
@@ -331,6 +419,12 @@ const DE: Strings = Strings {
     upd_install: "Jetzt herunterladen und installieren?",
     upd_uptodate: "Du hast bereits die neueste Version.",
     upd_failed: "Suche nach Updates fehlgeschlagen. Prüfe deine Verbindung und versuche es erneut.",
+    lbl_notify_errors: "Benachrichtigen, wenn der Empfänger nicht startet",
+    help_notify_errors: "Zeigt eine Benachrichtigung, wenn der AirPlay-Empfänger nicht starten kann. Der Grund steht so oder so im Protokoll.",
+    err_engine_title: "Empfänger nicht gestartet",
+    err_engine_body: "Der AirPlay-Empfänger konnte nicht starten. Öffne für Details den Protokollordner über das Tray-Menü.",
+    err_engine_bind: "Der AirPlay-Empfänger konnte auf dem gewählten Netzwerkadapter ({ip}) nicht starten. Stelle ihn in den Einstellungen wieder auf Automatisch.",
+    warn_pin_ignored: "Adapter nicht verfügbar — alle aktiv",
 };
 const FR: Strings = Strings {
     status_off: "arrêté", status_ready: "prêt", status_connected: "connecté",
@@ -345,11 +439,13 @@ const FR: Strings = Strings {
     lbl_borderless: "Fenêtre sans bordure", lbl_h265: "Activer la recopie H.265 / HEVC",
     lbl_decoder: "Décodeur matériel", lbl_audio_renderer: "Sortie audio",
     lbl_fps: "Fréquence d'images cible", lbl_display: "Écran", lbl_debug: "Journalisation de débogage détaillée",
+    lbl_network: "Carte réseau",
     save: "Enregistrer", cancel: "Annuler",
     about_what: "Présentation", about_builton: "Basé sur", about_contact: "Auteur / contact", about_license: "Licence", close: "Fermer",
     help_language: "Langue de l'interface. Auto = comme le système.",
     help_device_name: "Affiché dans le sélecteur AirPlay de l'iPhone, l'iPad ou le Mac.",
     help_display: "Sur quel moniteur s'ouvre la fenêtre vidéo.",
+    help_network: "Sur quelle carte réseau le récepteur écoute. Automatique = toutes.",
     help_start_with_windows: "Ajoute une entrée dans HKCU\\…\\Run.",
     help_autostart_launch: "Commence la diffusion dès le lancement de l'application dans la barre d'état. La fenêtre vidéo reste masquée jusqu'à ce qu'un appareil se connecte.",
     help_fullscreen: "La fenêtre vidéo s'ouvre en plein écran lorsqu'un appareil se connecte. Basculez à tout moment avec Alt+Enter / F / double-clic (Esc pour quitter).",
@@ -373,6 +469,12 @@ const FR: Strings = Strings {
     upd_install: "La télécharger et l'installer maintenant ?",
     upd_uptodate: "Vous avez déjà la dernière version.",
     upd_failed: "Impossible de rechercher des mises à jour. Vérifiez votre connexion et réessayez.",
+    lbl_notify_errors: "M'avertir si le récepteur ne démarre pas",
+    help_notify_errors: "Affiche une notification lorsque le récepteur AirPlay ne peut pas démarrer. La raison est écrite dans le journal dans tous les cas.",
+    err_engine_title: "Le récepteur n'a pas démarré",
+    err_engine_body: "Le récepteur AirPlay n'a pas pu démarrer. Ouvrez le dossier des journaux depuis le menu de la barre d'état pour les détails.",
+    err_engine_bind: "Le récepteur AirPlay n'a pas pu démarrer sur la carte réseau sélectionnée ({ip}). Remettez-la sur Automatique dans les paramètres.",
+    warn_pin_ignored: "carte indisponible — toutes à l'écoute",
 };
 const ES: Strings = Strings {
     status_off: "apagado", status_ready: "listo", status_connected: "conectado",
@@ -387,11 +489,13 @@ const ES: Strings = Strings {
     lbl_borderless: "Ventana sin bordes", lbl_h265: "Activar la duplicación H.265 / HEVC",
     lbl_decoder: "Decodificador por hardware", lbl_audio_renderer: "Salida de audio",
     lbl_fps: "Fotogramas por segundo objetivo", lbl_display: "Pantalla", lbl_debug: "Registro de depuración detallado",
+    lbl_network: "Adaptador de red",
     save: "Guardar", cancel: "Cancelar",
     about_what: "Qué es", about_builton: "Basado en", about_contact: "Autor / contacto", about_license: "Licencia", close: "Cerrar",
     help_language: "Idioma de la interfaz. Auto = igual que el sistema.",
     help_device_name: "Se muestra en el selector AirPlay del iPhone, iPad o Mac.",
     help_display: "En qué monitor se abre la ventana de vídeo.",
+    help_network: "En qué adaptador escucha el receptor. Automático = en todos.",
     help_start_with_windows: "Añade una entrada en HKCU\\…\\Run.",
     help_autostart_launch: "Comienza a transmitir en cuanto se inicia la app en la bandeja. La ventana de vídeo permanece oculta hasta que un dispositivo se conecta.",
     help_fullscreen: "La ventana de vídeo se abre a pantalla completa cuando un dispositivo se conecta. Alterna en cualquier momento con Alt+Enter / F / doble clic (Esc para salir).",
@@ -415,6 +519,12 @@ const ES: Strings = Strings {
     upd_install: "¿Descargarla e instalarla ahora?",
     upd_uptodate: "Ya tienes la última versión.",
     upd_failed: "No se pudo buscar actualizaciones. Comprueba tu conexión e inténtalo de nuevo.",
+    lbl_notify_errors: "Avisarme si el receptor no se inicia",
+    help_notify_errors: "Muestra una notificación cuando el receptor AirPlay no puede iniciarse. El motivo se escribe en el registro de todos modos.",
+    err_engine_title: "El receptor no se inició",
+    err_engine_body: "El receptor AirPlay no pudo iniciarse. Abre la carpeta de registros desde el menú de la bandeja para ver los detalles.",
+    err_engine_bind: "El receptor AirPlay no pudo iniciarse en el adaptador de red seleccionado ({ip}). Vuelve a ponerlo en Automático en la configuración.",
+    warn_pin_ignored: "adaptador no disponible — todos a la escucha",
 };
 const IT: Strings = Strings {
     status_off: "spento", status_ready: "pronto", status_connected: "connesso",
@@ -429,11 +539,13 @@ const IT: Strings = Strings {
     lbl_borderless: "Finestra senza bordi", lbl_h265: "Abilita il mirroring H.265 / HEVC",
     lbl_decoder: "Decoder hardware", lbl_audio_renderer: "Uscita audio",
     lbl_fps: "Frequenza fotogrammi target", lbl_display: "Schermo", lbl_debug: "Log di debug dettagliato",
+    lbl_network: "Scheda di rete",
     save: "Salva", cancel: "Annulla",
     about_what: "Cos'è", about_builton: "Basato su", about_contact: "Autore / contatti", about_license: "Licenza", close: "Chiudi",
     help_language: "Lingua dell'interfaccia. Auto = come il sistema.",
     help_device_name: "Mostrato nel selettore AirPlay di iPhone, iPad o Mac.",
     help_display: "Su quale monitor si apre la finestra video.",
+    help_network: "Su quale scheda di rete il ricevitore è in ascolto. Automatico = tutte.",
     help_start_with_windows: "Aggiunge una voce in HKCU\\…\\Run.",
     help_autostart_launch: "Inizia la trasmissione non appena l'app nella barra delle applicazioni si avvia. La finestra video resta nascosta finché un dispositivo non si connette.",
     help_fullscreen: "La finestra video si apre a schermo intero quando un dispositivo si connette. Attiva/disattiva in qualsiasi momento con Alt+Enter / F / doppio clic (Esc per uscire).",
@@ -457,6 +569,12 @@ const IT: Strings = Strings {
     upd_install: "Scaricarla e installarla ora?",
     upd_uptodate: "Hai già l'ultima versione.",
     upd_failed: "Impossibile controllare gli aggiornamenti. Verifica la connessione e riprova.",
+    lbl_notify_errors: "Avvisami se il ricevitore non si avvia",
+    help_notify_errors: "Mostra una notifica quando il ricevitore AirPlay non riesce ad avviarsi. Il motivo viene comunque scritto nel log.",
+    err_engine_title: "Il ricevitore non si è avviato",
+    err_engine_body: "Il ricevitore AirPlay non è riuscito ad avviarsi. Apri la cartella dei log dal menu nella barra per i dettagli.",
+    err_engine_bind: "Il ricevitore AirPlay non è riuscito ad avviarsi sulla scheda di rete selezionata ({ip}). Reimpostala su Automatico nelle impostazioni.",
+    warn_pin_ignored: "scheda non disponibile — tutte in ascolto",
 };
 const PT_BR: Strings = Strings {
     status_off: "desligado", status_ready: "pronto", status_connected: "conectado",
@@ -471,11 +589,13 @@ const PT_BR: Strings = Strings {
     lbl_borderless: "Janela sem bordas", lbl_h265: "Ativar espelhamento H.265 / HEVC",
     lbl_decoder: "Decodificador de hardware", lbl_audio_renderer: "Saída de áudio",
     lbl_fps: "Taxa de quadros desejada", lbl_display: "Tela", lbl_debug: "Log de depuração detalhado",
+    lbl_network: "Adaptador de rede",
     save: "Salvar", cancel: "Cancelar",
     about_what: "O que é", about_builton: "Baseado em", about_contact: "Autor / contato", about_license: "Licença", close: "Fechar",
     help_language: "Idioma da interface. Auto = igual ao sistema.",
     help_device_name: "Exibido no seletor AirPlay do iPhone, iPad ou Mac.",
     help_display: "Em qual monitor a janela de vídeo abre.",
+    help_network: "Em qual adaptador o receptor escuta. Automático = todos.",
     help_start_with_windows: "Adiciona uma entrada em HKCU\\…\\Run.",
     help_autostart_launch: "Começa a transmitir assim que o aplicativo na bandeja é iniciado. A janela de vídeo permanece oculta até um dispositivo conectar.",
     help_fullscreen: "A janela de vídeo abre em tela cheia quando um dispositivo conecta. Alterne a qualquer momento com Alt+Enter / F / clique duplo (Esc para sair).",
@@ -499,6 +619,12 @@ const PT_BR: Strings = Strings {
     upd_install: "Baixar e instalar agora?",
     upd_uptodate: "Você já tem a versão mais recente.",
     upd_failed: "Não foi possível verificar atualizações. Verifique sua conexão e tente novamente.",
+    lbl_notify_errors: "Avisar se o receptor não iniciar",
+    help_notify_errors: "Mostra uma notificação quando o receptor AirPlay não consegue iniciar. O motivo é gravado no log de qualquer forma.",
+    err_engine_title: "O receptor não iniciou",
+    err_engine_body: "O receptor AirPlay não conseguiu iniciar. Abra a pasta de logs pelo menu da bandeja para ver os detalhes.",
+    err_engine_bind: "O receptor AirPlay não conseguiu iniciar na placa de rede selecionada ({ip}). Volte para Automático nas configurações.",
+    warn_pin_ignored: "placa indisponível — ouvindo todas",
 };
 const PL: Strings = Strings {
     status_off: "wył.", status_ready: "gotowy", status_connected: "połączono",
@@ -513,11 +639,13 @@ const PL: Strings = Strings {
     lbl_borderless: "Okno bez ramki", lbl_h265: "Włącz dublowanie H.265 / HEVC",
     lbl_decoder: "Dekoder sprzętowy", lbl_audio_renderer: "Wyjście dźwięku",
     lbl_fps: "Docelowa liczba klatek", lbl_display: "Ekran", lbl_debug: "Szczegółowy dziennik debugowania",
+    lbl_network: "Karta sieciowa",
     save: "Zapisz", cancel: "Anuluj",
     about_what: "Co to jest", about_builton: "Oparte na", about_contact: "Autor / kontakt", about_license: "Licencja", close: "Zamknij",
     help_language: "Język interfejsu. Auto = jak w systemie.",
     help_device_name: "Wyświetlany w selektorze AirPlay na iPhonie, iPadzie lub Macu.",
     help_display: "Na którym monitorze otwiera się okno wideo.",
+    help_network: "Na której karcie sieciowej nasłuchuje odbiornik. Automatycznie = na wszystkich.",
     help_start_with_windows: "Dodaje wpis w HKCU\\…\\Run.",
     help_autostart_launch: "Rozpoczyna rozgłaszanie zaraz po uruchomieniu aplikacji w zasobniku. Okno wideo pozostaje ukryte, dopóki nie połączy się urządzenie.",
     help_fullscreen: "Okno wideo otwiera się na pełnym ekranie po połączeniu urządzenia. Przełączaj w dowolnej chwili za pomocą Alt+Enter / F / podwójnego kliknięcia (Esc kończy).",
@@ -541,6 +669,12 @@ const PL: Strings = Strings {
     upd_install: "Pobrać i zainstalować teraz?",
     upd_uptodate: "Masz już najnowszą wersję.",
     upd_failed: "Nie udało się sprawdzić aktualizacji. Sprawdź połączenie i spróbuj ponownie.",
+    lbl_notify_errors: "Powiadom, jeśli odbiornik się nie uruchomi",
+    help_notify_errors: "Pokazuje powiadomienie, gdy odbiornik AirPlay nie może się uruchomić. Powód i tak trafia do logu.",
+    err_engine_title: "Odbiornik nie uruchomił się",
+    err_engine_body: "Odbiornik AirPlay nie mógł się uruchomić. Otwórz folder logów z menu w zasobniku, aby poznać szczegóły.",
+    err_engine_bind: "Odbiornik AirPlay nie mógł się uruchomić na wybranej karcie sieciowej ({ip}). Ustaw ją z powrotem na Automatycznie w ustawieniach.",
+    warn_pin_ignored: "karta niedostępna — nasłuch na wszystkich",
 };
 const NL: Strings = Strings {
     status_off: "uit", status_ready: "gereed", status_connected: "verbonden",
@@ -555,11 +689,13 @@ const NL: Strings = Strings {
     lbl_borderless: "Venster zonder rand", lbl_h265: "H.265 / HEVC-spiegeling inschakelen",
     lbl_decoder: "Hardwaredecoder", lbl_audio_renderer: "Audio-uitvoer",
     lbl_fps: "Doelbeeldsnelheid", lbl_display: "Beeldscherm", lbl_debug: "Uitgebreide foutopsporingslogboeken",
+    lbl_network: "Netwerkadapter",
     save: "Opslaan", cancel: "Annuleren",
     about_what: "Wat het is", about_builton: "Gebouwd op", about_contact: "Auteur / contact", about_license: "Licentie", close: "Sluiten",
     help_language: "Taal van de interface. Auto = volgt het systeem.",
     help_device_name: "Wordt getoond in de AirPlay-kiezer op iPhone, iPad of Mac.",
     help_display: "Op welke monitor het videovenster opent.",
+    help_network: "Op welke adapter de ontvanger luistert. Automatisch = op alle.",
     help_start_with_windows: "Voegt een vermelding toe aan HKCU\\…\\Run.",
     help_autostart_launch: "Begint met uitzenden zodra de tray-app start. Het videovenster blijft verborgen tot een apparaat verbinding maakt.",
     help_fullscreen: "Het videovenster opent volledig scherm wanneer een apparaat verbinding maakt. Schakel op elk moment met Alt+Enter / F / dubbelklik (Esc sluit af).",
@@ -583,6 +719,12 @@ const NL: Strings = Strings {
     upd_install: "Nu downloaden en installeren?",
     upd_uptodate: "Je hebt al de nieuwste versie.",
     upd_failed: "Kon niet op updates controleren. Controleer je verbinding en probeer het opnieuw.",
+    lbl_notify_errors: "Waarschuw me als de ontvanger niet start",
+    help_notify_errors: "Toont een melding wanneer de AirPlay-ontvanger niet kan starten. De reden komt sowieso in het logbestand.",
+    err_engine_title: "Ontvanger is niet gestart",
+    err_engine_body: "De AirPlay-ontvanger kon niet starten. Open de logmap via het systeemvakmenu voor details.",
+    err_engine_bind: "De AirPlay-ontvanger kon niet starten op de gekozen netwerkadapter ({ip}). Zet deze in de instellingen terug op Automatisch.",
+    warn_pin_ignored: "adapter niet beschikbaar — luistert op alle",
 };
 const TR: Strings = Strings {
     status_off: "kapalı", status_ready: "hazır", status_connected: "bağlandı",
@@ -597,11 +739,13 @@ const TR: Strings = Strings {
     lbl_borderless: "Kenarlıksız pencere", lbl_h265: "H.265 / HEVC yansıtmayı etkinleştir",
     lbl_decoder: "Donanım kod çözücü", lbl_audio_renderer: "Ses çıkışı",
     lbl_fps: "Hedef kare hızı", lbl_display: "Ekran", lbl_debug: "Ayrıntılı hata ayıklama günlüğü",
+    lbl_network: "Ağ bağdaştırıcısı",
     save: "Kaydet", cancel: "İptal",
     about_what: "Nedir", about_builton: "Şunun üzerine kurulu", about_contact: "Yazar / iletişim", about_license: "Lisans", close: "Kapat",
     help_language: "Arayüz dili. Auto = sistemi izler.",
     help_device_name: "iPhone, iPad veya Mac'in AirPlay seçicisinde gösterilir.",
     help_display: "Video penceresinin hangi monitörde açılacağı.",
+    help_network: "Alıcının hangi ağ bağdaştırıcısında dinleyeceği. Otomatik = tümü.",
     help_start_with_windows: "HKCU\\…\\Run'a bir kayıt ekler.",
     help_autostart_launch: "Tepsi uygulaması başlar başlamaz yayına başlar. Bir aygıt bağlanana kadar video penceresi gizli kalır.",
     help_fullscreen: "Bir aygıt bağlandığında video penceresi tam ekran açılır. Alt+Enter / F / çift tıklama ile istediğiniz zaman değiştirin (Esc çıkar).",
@@ -625,6 +769,12 @@ const TR: Strings = Strings {
     upd_install: "Şimdi indirilip kurulsun mu?",
     upd_uptodate: "Zaten en son sürüme sahipsin.",
     upd_failed: "Güncellemeler denetlenemedi. Bağlantını kontrol edip tekrar dene.",
+    lbl_notify_errors: "Alıcı başlatılamazsa bildir",
+    help_notify_errors: "AirPlay alıcısı başlatılamadığında bir bildirim gösterir. Nedeni her durumda günlüğe yazılır.",
+    err_engine_title: "Alıcı başlatılamadı",
+    err_engine_body: "AirPlay alıcısı başlatılamadı. Ayrıntılar için tepsi menüsünden günlük klasörünü aç.",
+    err_engine_bind: "AirPlay alıcısı seçilen ağ bağdaştırıcısında ({ip}) başlatılamadı. Ayarlardan yeniden Otomatik yap.",
+    warn_pin_ignored: "bağdaştırıcı yok — tümü dinleniyor",
 };
 const ZH_CN: Strings = Strings {
     status_off: "关闭", status_ready: "就绪", status_connected: "已连接",
@@ -639,11 +789,13 @@ const ZH_CN: Strings = Strings {
     lbl_borderless: "无边框窗口", lbl_h265: "启用 H.265 / HEVC 镜像",
     lbl_decoder: "硬件解码器", lbl_audio_renderer: "音频输出",
     lbl_fps: "目标帧率", lbl_display: "显示器", lbl_debug: "详细调试日志",
+    lbl_network: "网络适配器",
     save: "保存", cancel: "取消",
     about_what: "简介", about_builton: "基于", about_contact: "作者 / 联系方式", about_license: "许可证", close: "关闭",
     help_language: "界面语言。Auto = 跟随系统。",
     help_device_name: "在 iPhone、iPad 或 Mac 的 AirPlay 选择器中显示。",
     help_display: "视频窗口在哪个显示器上打开。",
+    help_network: "接收端在哪个网络适配器上监听。自动 = 全部。",
     help_start_with_windows: "在 HKCU\\…\\Run 中添加一项。",
     help_autostart_launch: "托盘应用启动后立即开始广播。在设备连接之前，视频窗口保持隐藏。",
     help_fullscreen: "设备连接时视频窗口以全屏打开。随时使用 Alt+Enter / F / 双击切换（Esc 退出）。",
@@ -667,6 +819,12 @@ const ZH_CN: Strings = Strings {
     upd_install: "现在下载并安装吗？",
     upd_uptodate: "你已经是最新版本了。",
     upd_failed: "无法检查更新。请检查网络连接后重试。",
+    lbl_notify_errors: "接收器启动失败时通知我",
+    help_notify_errors: "AirPlay 接收器无法启动时显示通知。无论是否开启，原因都会写入日志。",
+    err_engine_title: "接收器未启动",
+    err_engine_body: "AirPlay 接收器无法启动。请从托盘菜单打开日志文件夹查看详情。",
+    err_engine_bind: "AirPlay 接收器无法在所选网络适配器（{ip}）上启动。请在设置中将其改回“自动”。",
+    warn_pin_ignored: "适配器不可用 — 正在监听全部",
 };
 const JA: Strings = Strings {
     status_off: "オフ", status_ready: "準備完了", status_connected: "接続中",
@@ -681,11 +839,13 @@ const JA: Strings = Strings {
     lbl_borderless: "枠なしウィンドウ", lbl_h265: "H.265 / HEVC ミラーリングを有効化",
     lbl_decoder: "ハードウェアデコーダー", lbl_audio_renderer: "オーディオ出力",
     lbl_fps: "目標フレームレート", lbl_display: "ディスプレイ", lbl_debug: "詳細なデバッグログ",
+    lbl_network: "ネットワークアダプター",
     save: "保存", cancel: "キャンセル",
     about_what: "概要", about_builton: "ベース技術", about_contact: "作者 / 連絡先", about_license: "ライセンス", close: "閉じる",
     help_language: "UI の言語。Auto = システムに従う。",
     help_device_name: "iPhone・iPad・Mac の AirPlay 選択画面に表示されます。",
     help_display: "ビデオウィンドウをどのモニターで開くか。",
+    help_network: "レシーバーが待ち受けるネットワークアダプター。自動 = すべて。",
     help_start_with_windows: "HKCU\\…\\Run にエントリを追加します。",
     help_autostart_launch: "トレイアプリの起動と同時に配信を開始します。デバイスが接続するまでビデオウィンドウは非表示のままです。",
     help_fullscreen: "デバイスが接続するとビデオウィンドウが全画面で開きます。Alt+Enter / F / ダブルクリックでいつでも切り替え可能（Esc で終了）。",
@@ -709,6 +869,12 @@ const JA: Strings = Strings {
     upd_install: "今すぐダウンロードしてインストールしますか？",
     upd_uptodate: "すでに最新バージョンです。",
     upd_failed: "アップデートを確認できませんでした。接続を確認してもう一度お試しください。",
+    lbl_notify_errors: "レシーバーが起動できないときに通知する",
+    help_notify_errors: "AirPlay レシーバーが起動できないときに通知を表示します。理由はいずれの場合もログに記録されます。",
+    err_engine_title: "レシーバーが起動しませんでした",
+    err_engine_body: "AirPlay レシーバーを起動できませんでした。詳細はトレイメニューからログフォルダーを開いてください。",
+    err_engine_bind: "選択したネットワークアダプター（{ip}）で AirPlay レシーバーを起動できませんでした。設定で「自動」に戻してください。",
+    warn_pin_ignored: "アダプター使用不可 — すべてで待受",
 };
 const KO: Strings = Strings {
     status_off: "꺼짐", status_ready: "준비됨", status_connected: "연결됨",
@@ -723,11 +889,13 @@ const KO: Strings = Strings {
     lbl_borderless: "테두리 없는 창", lbl_h265: "H.265 / HEVC 미러링 사용",
     lbl_decoder: "하드웨어 디코더", lbl_audio_renderer: "오디오 출력",
     lbl_fps: "목표 프레임 속도", lbl_display: "디스플레이", lbl_debug: "상세 디버그 로깅",
+    lbl_network: "네트워크 어댑터",
     save: "저장", cancel: "취소",
     about_what: "소개", about_builton: "기반 기술", about_contact: "제작자 / 연락처", about_license: "라이선스", close: "닫기",
     help_language: "UI 언어. Auto = 시스템을 따름.",
     help_device_name: "iPhone, iPad, Mac의 AirPlay 선택기에 표시됩니다.",
     help_display: "비디오 창이 열릴 모니터.",
+    help_network: "수신기가 대기할 네트워크 어댑터. 자동 = 전체.",
     help_start_with_windows: "HKCU\\…\\Run에 항목을 추가합니다.",
     help_autostart_launch: "트레이 앱이 실행되는 즉시 송출을 시작합니다. 기기가 연결될 때까지 비디오 창은 숨겨진 상태로 유지됩니다.",
     help_fullscreen: "기기가 연결되면 비디오 창이 전체 화면으로 열립니다. Alt+Enter / F / 더블 클릭으로 언제든지 전환하세요(Esc로 종료).",
@@ -751,6 +919,12 @@ const KO: Strings = Strings {
     upd_install: "지금 다운로드하여 설치할까요?",
     upd_uptodate: "이미 최신 버전입니다.",
     upd_failed: "업데이트를 확인할 수 없습니다. 연결을 확인하고 다시 시도하세요.",
+    lbl_notify_errors: "수신기가 시작되지 않으면 알림",
+    help_notify_errors: "AirPlay 수신기를 시작할 수 없을 때 알림을 표시합니다. 이유는 어느 경우든 로그에 기록됩니다.",
+    err_engine_title: "수신기가 시작되지 않았습니다",
+    err_engine_body: "AirPlay 수신기를 시작할 수 없습니다. 자세한 내용은 트레이 메뉴에서 로그 폴더를 여세요.",
+    err_engine_bind: "선택한 네트워크 어댑터({ip})에서 AirPlay 수신기를 시작할 수 없습니다. 설정에서 다시 자동으로 바꾸세요.",
+    warn_pin_ignored: "어댑터 사용 불가 — 전체 수신 중",
 };
 const AR: Strings = Strings {
     status_off: "متوقف", status_ready: "جاهز", status_connected: "متصل",
@@ -765,11 +939,13 @@ const AR: Strings = Strings {
     lbl_borderless: "نافذة بلا حدود", lbl_h265: "تفعيل النسخ المرآوي H.265 / HEVC",
     lbl_decoder: "وحدة فك ترميز للأجهزة", lbl_audio_renderer: "إخراج الصوت",
     lbl_fps: "معدل الإطارات المستهدف", lbl_display: "الشاشة", lbl_debug: "سجل تصحيح مفصّل",
+    lbl_network: "محول الشبكة",
     save: "حفظ", cancel: "إلغاء",
     about_what: "ما هو", about_builton: "مبني على", about_contact: "المؤلف / التواصل", about_license: "الترخيص", close: "إغلاق",
     help_language: "لغة الواجهة. Auto = حسب النظام.",
     help_device_name: "يظهر في قائمة اختيار AirPlay على iPhone وiPad وMac.",
     help_display: "الشاشة التي تُفتح عليها نافذة الفيديو.",
+    help_network: "محول الشبكة الذي يستمع عليه المستقبل. تلقائي = كل المحولات.",
     help_start_with_windows: "يضيف إدخالاً إلى HKCU\\…\\Run.",
     help_autostart_launch: "يبدأ البث بمجرد تشغيل تطبيق علبة النظام. تبقى نافذة الفيديو مخفية حتى يتصل جهاز.",
     help_fullscreen: "تُفتح نافذة الفيديو بملء الشاشة عند اتصال جهاز. بدّل في أي وقت باستخدام Alt+Enter / F / النقر المزدوج (Esc للخروج).",
@@ -793,6 +969,12 @@ const AR: Strings = Strings {
     upd_install: "هل تريد تنزيله وتثبيته الآن؟",
     upd_uptodate: "لديك بالفعل أحدث إصدار.",
     upd_failed: "تعذّر التحقق من التحديثات. تحقق من اتصالك وحاول مرة أخرى.",
+    lbl_notify_errors: "أعلمني عند فشل تشغيل المستقبل",
+    help_notify_errors: "يعرض إشعارًا عندما يتعذّر تشغيل مستقبل AirPlay. يُكتب السبب في السجل في كل الأحوال.",
+    err_engine_title: "لم يبدأ المستقبل",
+    err_engine_body: "تعذّر تشغيل مستقبل AirPlay. افتح مجلد السجلات من قائمة شريط النظام لمعرفة التفاصيل.",
+    err_engine_bind: "تعذّر تشغيل مستقبل AirPlay على محوّل الشبكة المحدّد ({ip}). أعِده إلى «تلقائي» في الإعدادات.",
+    warn_pin_ignored: "المحوّل غير متاح — الاستماع على الكل",
 };
 const HI: Strings = Strings {
     status_off: "बंद", status_ready: "तैयार", status_connected: "कनेक्ट किया गया",
@@ -807,11 +989,13 @@ const HI: Strings = Strings {
     lbl_borderless: "बिना किनारे वाली विंडो", lbl_h265: "H.265 / HEVC मिररिंग सक्षम करें",
     lbl_decoder: "हार्डवेयर डिकोडर", lbl_audio_renderer: "ऑडियो आउटपुट",
     lbl_fps: "लक्षित फ़्रेम दर", lbl_display: "डिस्प्ले", lbl_debug: "विस्तृत डिबग लॉगिंग",
+    lbl_network: "नेटवर्क अडैप्टर",
     save: "सहेजें", cancel: "रद्द करें",
     about_what: "यह क्या है", about_builton: "इस पर आधारित", about_contact: "लेखक / संपर्क", about_license: "लाइसेंस", close: "बंद करें",
     help_language: "इंटरफ़ेस की भाषा। Auto = सिस्टम के अनुसार।",
     help_device_name: "iPhone, iPad या Mac के AirPlay चयनकर्ता में दिखाया जाता है।",
     help_display: "वीडियो विंडो किस मॉनिटर पर खुलती है।",
+    help_network: "रिसीवर किस अडैप्टर पर सुनता है। स्वचालित = सभी पर।",
     help_start_with_windows: "HKCU\\…\\Run में एक प्रविष्टि जोड़ता है।",
     help_autostart_launch: "ट्रे ऐप शुरू होते ही प्रसारण शुरू कर देता है। जब तक कोई डिवाइस कनेक्ट नहीं होता, वीडियो विंडो छिपी रहती है।",
     help_fullscreen: "जब कोई डिवाइस कनेक्ट होता है तो वीडियो विंडो पूर्ण स्क्रीन में खुलती है। Alt+Enter / F / डबल-क्लिक से कभी भी टॉगल करें (Esc से बाहर निकलें)।",
@@ -835,4 +1019,10 @@ const HI: Strings = Strings {
     upd_install: "अभी डाउनलोड करके इंस्टॉल करें?",
     upd_uptodate: "आपके पास पहले से ही नवीनतम संस्करण है।",
     upd_failed: "अपडेट जाँचना संभव नहीं हुआ। अपना कनेक्शन जाँचें और फिर से प्रयास करें।",
+    lbl_notify_errors: "रिसीवर शुरू न हो तो सूचित करें",
+    help_notify_errors: "जब AirPlay रिसीवर शुरू नहीं हो पाता, तब एक सूचना दिखाता है। कारण हर हाल में लॉग में लिखा जाता है।",
+    err_engine_title: "रिसीवर शुरू नहीं हुआ",
+    err_engine_body: "AirPlay रिसीवर शुरू नहीं हो सका। विवरण के लिए ट्रे मेनू से लॉग फ़ोल्डर खोलें।",
+    err_engine_bind: "चुने गए नेटवर्क अडैप्टर ({ip}) पर AirPlay रिसीवर शुरू नहीं हो सका। सेटिंग्स में इसे वापस स्वचालित पर सेट करें।",
+    warn_pin_ignored: "अडैप्टर अनुपलब्ध — सभी पर सुन रहे हैं",
 };

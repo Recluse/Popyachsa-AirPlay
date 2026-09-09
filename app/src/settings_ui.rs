@@ -1,7 +1,7 @@
-//! Settings window — `popyachsa-airplay.exe --settings` spawns this in its own
+//! Settings window — `popyachsa-tv.exe --settings` spawns this in its own
 //! process, runs an eframe event loop, lets the user edit Config, writes it
 //! back to disk and exits. The main tray's config-watcher then picks up the
-//! file change and restarts the engine with the new flags.
+//! file change and restarts uxplay with the new flags.
 
 use eframe::egui::{self, Color32, FontId, Margin, RichText, Rounding, Stroke, Vec2};
 
@@ -314,6 +314,35 @@ impl eframe::App for SettingsApp {
                                     });
                             });
                         }
+                        // NIC selector. Deliberately NOT gated on `len() > 1` the
+                        // way the Display row is: "Automatic" is not "the one
+                        // adapter", it is INADDR_ANY — every interface, including
+                        // the VPN tunnels `list()` filters out. On a laptop with
+                        // eth0 plus an up tun0 the list holds one entry, and
+                        // hiding the row there would remove the only way to stop
+                        // listening on the VPN. Also shown when a pin is set, so
+                        // a pin that outlived its adapter stays clearable instead
+                        // of sticking invisibly in the config file.
+                        let nics = crate::net_interfaces::list();
+                        if !nics.is_empty() || edited.bind_ip.is_some() {
+                            labelled_row(ui, t.lbl_network, t.help_network, |ui| {
+                                let cur_text = crate::net_interfaces::label(
+                                    &nics, edited.bind_ip.as_deref());
+                                egui::ComboBox::from_id_salt("bind_ip")
+                                    .selected_text(cur_text)
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut edited.bind_ip, None, "Automatic");
+                                        for n in &nics {
+                                            // Showing the IP is not decoration: it is
+                                            // how the user checks their pick against
+                                            // the phone's own Wi-Fi settings.
+                                            ui.selectable_value(&mut edited.bind_ip,
+                                                                Some(n.ip.clone()),
+                                                                format!("{} ({})", n.name, n.ip));
+                                        }
+                                    });
+                            });
+                        }
                     });
 
                     self.section(ui, t.sec_autostart, |ui, edited| {
@@ -445,6 +474,9 @@ impl eframe::App for SettingsApp {
                         checkbox_row(ui, &mut edited.check_updates_on_launch,
                                      t.lbl_check_updates,
                                      t.help_check_updates);
+                        checkbox_row(ui, &mut edited.notify_on_engine_error,
+                                     t.lbl_notify_errors,
+                                     t.help_notify_errors);
                         checkbox_row(ui, &mut edited.debug_logging,
                                      t.lbl_debug,
                                      t.help_debug);

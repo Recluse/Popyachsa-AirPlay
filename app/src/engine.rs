@@ -1,4 +1,4 @@
-//! In-process AirPlay engine + host window (Plan B, stage B4).
+//! In-process AirPlay engine + host window (Windows).
 //!
 //! Replaces the old `uxplay.rs` subprocess model. Instead of spawning
 //! `uxplay.exe` and fighting its `d3d11videosink` window across a process
@@ -141,6 +141,26 @@ extern "C" fn engine_log_cb(_level: c_int, msg: *const c_char, _user: *mut c_voi
         return;
     }
     let hwnd = HWND(hwnd_raw as *mut c_void);
+    // The engine gave up during startup. Nothing else will ever tell us: the C ABI
+    // called this run a success the moment the worker spawned, so without this the
+    // pump keeps running, the tray keeps showing "Ready", and the receiver is
+    // simply invisible to every device. Flag it and report Off; the tray consumes
+    // the flag, does the real teardown (it owns the Engine) and tells the user.
+    if crate::status::is_fatal_start_line(&text) {
+        crate::status::START_FAILED.store(true, Ordering::SeqCst);
+        send_status(Status::Off);
+        return;
+    }
+    // The pinned adapter was gone and the engine fell back to every interface. It
+    // KEEPS RUNNING, so this changes nothing but the tray's menu text — and the
+    // resend is what gets that menu rebuilt, since the tray only rebuilds on a
+    // status event and this line lands while the engine is still starting.
+    if crate::status::is_pin_ignored_line(&text) {
+        if !crate::status::PIN_IGNORED.swap(true, Ordering::SeqCst) {
+            send_status(Status::Ready);
+        }
+        return;
+    }
     if text.contains(MARK_CONNECTED) {
         if !CONNECTED.swap(true, Ordering::SeqCst) {
             unsafe { let _ = PostMessageW(Some(hwnd), WM_APP_CONNECTED, WPARAM(0), LPARAM(0)); }
@@ -216,6 +236,12 @@ fn build_options(cfg: &Config) -> String {
         a.extend(["-as".into(), cfg.audio_sink.clone()]);
     }
     a.push("-FPSdata".into());
+    // Bind + advertise on ONE adapter (fork-only `-bind`). Omitted when unset so
+    // the argv tail stays byte-identical to what shipped before this setting
+    // existed. custom_flags stays last, so a hand-typed -bind there still wins.
+    if let Some(ip) = crate::net_interfaces::bind_arg(cfg.bind_ip.as_deref()) {
+        a.extend(["-bind".into(), ip.to_string()]);
+    }
     if !cfg.custom_flags.trim().is_empty() {
         for tok in cfg.custom_flags.split_whitespace() {
             a.push(tok.to_string());
@@ -497,7 +523,12 @@ fn set_topmost_hwnd(hwnd: HWND, on: bool) {
 }
 
 /// Body of the host-window thread: create window, start engine into it, pump.
-fn run_host_window(cfg: Config, hwnd_out: Arc<AtomicIsize>, running: Arc<AtomicBool>) {
+fn run_host_window(
+    cfg: Config,
+    hwnd_out: Arc<AtomicIsize>,
+    running: Arc<AtomicBool>,
+    stop_req: Arc<AtomicBool>,
+) {
     unsafe {
         let hinstance = match GetModuleHandleW(None) {
             Ok(h) => h,
@@ -548,7 +579,23 @@ fn run_host_window(cfg: Config, hwnd_out: Arc<AtomicIsize>, running: Arc<AtomicB
         };
         hwnd_out.store(hwnd.0 as isize, Ordering::SeqCst);
         CB_HWND.store(hwnd.0 as isize, Ordering::SeqCst);
+        // A Stop/Restart/Quit that landed while this thread was still creating its
+        // window found hwnd == 0, so it posted no WM_CLOSE — and then joined a
+        // thread that was about to enter an endless message pump, hanging the tray
+        // for good. `stop()` sets this flag BEFORE it reads the HWND, so with both
+        // under SeqCst either it sees our HWND and posts, or we see its flag here.
+        if stop_req.load(Ordering::SeqCst) {
+            eprintln!("[engine] stop requested during startup; window created, standing down");
+            CB_HWND.store(0, Ordering::SeqCst);
+            hwnd_out.store(0, Ordering::SeqCst);
+            let _ = DestroyWindow(hwnd);
+            running.store(false, Ordering::SeqCst);
+            return;
+        }
         CONNECTED.store(false, Ordering::SeqCst);
+        // Per-run, like CONNECTED: last run's failure / ignored-pin verdict must not
+        // outlive it, or the tray keeps warning about an adapter the user already fixed.
+        crate::status::reset_run_flags();
         if cfg.always_on_top {
             set_topmost_hwnd(hwnd, true);
         }
@@ -601,19 +648,30 @@ fn run_host_window(cfg: Config, hwnd_out: Arc<AtomicIsize>, running: Arc<AtomicB
             }
         };
         ap.set_log_callback(engine_log_cb, std::ptr::null_mut());
-        let _ = ap.set_device_name(&cfg.device_name);
-        let _ = ap.set_window(hwnd.0 as *mut c_void);
-        let _ = ap.set_options(&build_options(&cfg));
-        if let Err(e) = ap.start() {
-            eprintln!("[engine] start: {e}");
+        // Checked, not `let _`: a config string with an interior NUL (config.json
+        // is hand-edited) fails CString::new, and swallowing that ran the engine
+        // with NO options at all — no -bind, no sink, no fps — under a Ready tray.
+        // A failure here is the same kind of event as an engine that dies during
+        // startup, so it takes the same route: flag + Off, and the tray does the
+        // teardown (this thread must keep pumping until its WM_CLOSE arrives).
+        let mut setup = || -> anyhow::Result<()> {
+            ap.set_device_name(&cfg.device_name)?;
+            ap.set_window(hwnd.0 as *mut c_void)?;
+            ap.set_options(&build_options(&cfg))?;
+            ap.start()
+        };
+        let started = setup();
+        if let Err(e) = &started {
+            eprintln!("[engine] start: {e:#}");
+            crate::status::START_FAILED.store(true, Ordering::SeqCst);
         }
         running.store(true, Ordering::SeqCst);
         // Engine is up and advertising (no device yet) -> show the "Ready" state in
         // the tray. Without this, an autostarted engine leaves the icon on "Off"
         // until a device connects (the only later events are Connected/Ready-on-
         // disconnect/Off-on-teardown).
-        send_status(Status::Ready);
-        eprintln!("[engine] host window {:?} up; engine started", hwnd.0);
+        send_status(if started.is_ok() { Status::Ready } else { Status::Off });
+        eprintln!("[engine] host window {:?} up; engine started: {}", hwnd.0, started.is_ok());
 
         // Win32 message pump — runs until WM_CLOSE -> PostQuitMessage.
         let mut msg = MSG::default();
@@ -715,6 +773,9 @@ fn run_host_window(cfg: Config, hwnd_out: Arc<AtomicIsize>, running: Arc<AtomicB
 pub struct Engine {
     hwnd: Arc<AtomicIsize>,
     running: Arc<AtomicBool>,
+    /// Set by `stop()` before it looks at the HWND; the worker checks it once its
+    /// window exists. Covers the gap where there is no HWND to post WM_CLOSE to.
+    stop_req: Arc<AtomicBool>,
     thread: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -723,6 +784,7 @@ impl Engine {
         Self {
             hwnd: Arc::new(AtomicIsize::new(0)),
             running: Arc::new(AtomicBool::new(false)),
+            stop_req: Arc::new(AtomicBool::new(false)),
             thread: Mutex::new(None),
         }
     }
@@ -744,12 +806,15 @@ impl Engine {
         if let Some(t) = self.thread.lock().unwrap().take() {
             let _ = t.join();
         }
+        // Clear the previous run's stop request before the worker can read it.
+        self.stop_req.store(false, Ordering::SeqCst);
         let cfg = cfg.clone();
         let hwnd = self.hwnd.clone();
         let running = self.running.clone();
+        let stop_req = self.stop_req.clone();
         match std::thread::Builder::new()
             .name("airplay-host-window".into())
-            .spawn(move || run_host_window(cfg, hwnd, running))
+            .spawn(move || run_host_window(cfg, hwnd, running, stop_req))
         {
             Ok(handle) => {
                 *self.thread.lock().unwrap() = Some(handle);
@@ -763,6 +828,10 @@ impl Engine {
     }
 
     pub fn stop(&self) {
+        // BEFORE reading the HWND: the worker publishes its HWND and then reads
+        // this flag, so one of the two always sees the other and the join below
+        // cannot outlive the worker (see run_host_window).
+        self.stop_req.store(true, Ordering::SeqCst);
         let h = self.hwnd.load(Ordering::SeqCst);
         if h != 0 {
             unsafe {

@@ -37,9 +37,12 @@ use crate::status::Status;
 use crate::AppEvent;
 
 // UxPlay log markers. With macOS always-reinit (uxplay.cpp), "Begin streaming"
-// (an INFO line) reliably fires on every connect / reconnect / engine restart, so
-// it's the window-show trigger. The "begin video stream wxh" DEBUG line is only
-// used to capture the aspect (it was unreliable across an engine restart).
+// reliably fires on every connect / reconnect / engine restart, so it's the
+// window-show trigger. "begin video stream wxh" only captures the aspect (it was
+// unreliable across an engine restart). BOTH are LOGGER_INFO in the fork
+// (renderers/video_renderer.c) and must stay that way: the host reads them
+// through the log callback with debug logging OFF, which is the default, so
+// demoting either to DEBUG silently breaks show-on-connect and aspect-fit.
 const MARK_CONNECTED: &str = "Begin streaming";
 const MARK_TEARDOWN: &str = "Open connections: 0";
 
@@ -117,8 +120,11 @@ fn core_dylib_path() -> String {
             }
         }
     }
-    // Fall back to a bare name and let the loader search path resolve it.
-    PathBuf::from("uxplay-core.dylib").to_string_lossy().into_owned()
+    // Dev fallback: the M1 build tree.
+    let dev = dirs::home_dir()
+        .map(|h| h.join("uxplay-mac-build/UxPlay/build-arm64/uxplay-core.dylib"))
+        .unwrap_or_else(|| PathBuf::from("uxplay-core.dylib"));
+    dev.to_string_lossy().into_owned()
 }
 
 /// When running from a packaged `.app`, point GStreamer at the BUNDLED plugins +
@@ -128,11 +134,22 @@ fn core_dylib_path() -> String {
 fn set_bundled_gst_env() {
     let Ok(exe) = std::env::current_exe() else { return };
     let Some(macos) = exe.parent() else { return }; // …/Foo.app/Contents/MacOS
-    let gst = macos.join("../Frameworks/GStreamer");
-    let plugins = gst.join("lib/gstreamer-1.0");
-    if !plugins.exists() {
+    // The tree itself always lives in Contents/Resources/GStreamer; whether a
+    // symlink to it exists at Contents/Frameworks/GStreamer depends on the
+    // release (make-app.sh's GST_SYMLINK — the symlink cannot ship in the same
+    // release that first teaches the updater to recreate symlinks). So PROBE
+    // both rather than hard-coding one: this is
+    // what lets an app and a bundle from different releases work together in
+    // either direction, which is exactly the pairing that has bitten this
+    // project repeatedly.
+    let Some(gst) = ["../Resources/GStreamer", "../Frameworks/GStreamer"]
+        .iter()
+        .map(|rel| macos.join(rel))
+        .find(|p| p.join("lib/gstreamer-1.0").is_dir())
+    else {
         return; // not a bundled run
-    }
+    };
+    let plugins = gst.join("lib/gstreamer-1.0");
     std::env::set_var("GST_PLUGIN_SYSTEM_PATH_1_0", &plugins);
     std::env::set_var("GST_PLUGIN_PATH_1_0", &plugins);
     let scanner = gst.join("libexec/gstreamer-1.0/gst-plugin-scanner");
@@ -184,6 +201,12 @@ fn build_options(cfg: &Config) -> String {
     };
     a.extend(["-as".into(), asink.to_string()]);
     a.push("-FPSdata".into());
+    // Bind + advertise on ONE adapter (fork-only `-bind`). Omitted when unset so
+    // the argv tail stays byte-identical to what shipped before this setting
+    // existed. custom_flags stays last, so a hand-typed -bind there still wins.
+    if let Some(ip) = crate::net_interfaces::bind_arg(cfg.bind_ip.as_deref()) {
+        a.extend(["-bind".into(), ip.to_string()]);
+    }
     if !cfg.custom_flags.trim().is_empty() {
         for tok in cfg.custom_flags.split_whitespace() {
             a.push(tok.to_string());
@@ -214,6 +237,30 @@ extern "C" fn engine_log_cb(_level: c_int, msg: *const c_char, _user: *mut c_voi
         return;
     }
     let text = unsafe { CStr::from_ptr(msg) }.to_string_lossy();
+
+    // The engine gave up during startup. Nothing else will ever tell us: the C ABI
+    // called this run a success the moment the worker spawned, so without this the
+    // tray keeps showing "Ready" for a receiver no device can see. Flag it and
+    // report Off; the tray consumes the flag, does the real teardown (only the main
+    // thread may touch the Engine here) and tells the user.
+    if crate::status::is_fatal_start_line(&text) {
+        eprintln!("[engine-macos] fatal start error: {text}");
+        crate::status::START_FAILED.store(true, Ordering::SeqCst);
+        send_status(Status::Off);
+        return;
+    }
+
+    // The pinned adapter was gone and the engine fell back to every interface. It
+    // KEEPS RUNNING, so this changes nothing but the tray's menu text — and the
+    // resend is what gets that menu rebuilt, since the tray only rebuilds on a
+    // status event and this line lands while the engine is still starting.
+    if crate::status::is_pin_ignored_line(&text) {
+        if !crate::status::PIN_IGNORED.swap(true, Ordering::SeqCst) {
+            eprintln!("[engine-macos] pinned adapter unavailable: {text}");
+            send_status(Status::Ready);
+        }
+        return;
+    }
 
     // Disconnect: device gone (RAOP connections dropped to zero).
     if text.contains(MARK_TEARDOWN) {
@@ -250,6 +297,34 @@ extern "C" fn engine_log_cb(_level: c_int, msg: *const c_char, _user: *mut c_voi
     }
 }
 
+/// Wait on `done` for at most `secs`. Returns whether it was actually signalled
+/// (false = the deadline won and the caller should carry on regardless).
+///
+/// Deliberately a plain sleep-poll and NOT a nested `CFRunLoopRunInMode`, even
+/// though pumping the run loop here would let the main dispatch queue drain while
+/// we wait. We are called from *inside* the tao event callback, and tao holds a
+/// non-reentrant `std::sync::Mutex` on its handler for the whole duration of that
+/// callback (`Handler::handle_nonuser_event` locks `callback` and invokes us
+/// while still holding the guard; the inner `EventLoopHandler` then also
+/// `borrow_mut`s a `RefCell`). A nested run loop dispatches Cocoa events straight
+/// back into that handler on this same thread, which self-deadlocks on the mutex
+/// — a hang no deadline can break, since the deadline check never runs again.
+///
+/// Not pumping is safe because nothing the teardown does needs the main queue any
+/// more: `avlayer_sink_create` dispatches asynchronously (see
+/// renderers/avsample_sink.m). Should some future path block on the main queue
+/// again, the cost here is a bounded `secs` delay on quit, not a deadlock.
+fn wait_bounded(done: &AtomicBool, secs: f64) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(secs);
+    while !done.load(Ordering::SeqCst) {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    true
+}
+
 struct Inner {
     window: Option<Window>,
     airplay: Option<AirPlay>,
@@ -261,6 +336,11 @@ struct Inner {
     transitioning: bool,          // a stop/restart join is running on a worker thread
     next_cfg: Option<Config>,     // start with this once the current teardown finishes
     queued: Option<Option<Config>>, // a request that arrived mid-transition (latest wins)
+    // The in-flight teardown thread. Kept (not detached) so a Quit landing mid-
+    // transition can WAIT for it — otherwise `stop_blocking` finds `airplay: None`,
+    // skips the teardown it promises, and `process::exit(0)` runs while that thread
+    // is still inside GStreamer teardown / logger_destroy / dlclose.
+    join: Option<std::thread::JoinHandle<()>>,
     // A rotation arrived while fullscreen (can't resize a fullscreen window): re-fit
     // the windowed frame to the current aspect once we're back in windowed mode.
     pending_refit: bool,
@@ -283,6 +363,7 @@ impl Engine {
                 transitioning: false,
                 next_cfg: None,
                 queued: None,
+                join: None,
                 pending_refit: false,
             }),
         }
@@ -325,17 +406,43 @@ impl Engine {
         let dll = core_dylib_path();
         let mut ap = AirPlay::load(&dll)?;
         ap.set_log_callback(engine_log_cb, std::ptr::null_mut());
-        let _ = ap.set_device_name(&cfg.device_name);
-        let _ = ap.set_window(inner.nsview as *mut c_void);
-        let _ = ap.set_options(&build_options(cfg));
+        // NOT `let _`: a config string with an interior NUL (config.json is hand-
+        // edited, and a JSON \u0000 escape is a legal way to write one) fails
+        // CString::new here, and swallowing that started the engine with NO options
+        // at all — no -bind, no sink, no fps — while the tray reported Ready. The C
+        // side only ever returns non-zero for a null handle, which `AirPlay::load`
+        // already ruled out, so these are the config errors they look like.
+        ap.set_device_name(&cfg.device_name)?;
+        ap.set_window(inner.nsview as *mut c_void)?;
+        ap.set_options(&build_options(cfg))?;
         CONNECTED.store(false, Ordering::SeqCst);
         ASPECT_WH.store(0, Ordering::SeqCst);
+        // Per-run, like the two above: last run's failure / ignored-pin verdict must
+        // not outlive it, or the tray keeps warning about an adapter already fixed.
+        crate::status::reset_run_flags();
         ap.start()?;
         inner.airplay = Some(ap);
         inner.running = true;
         inner.fullscreen = cfg.fullscreen;
         eprintln!("[engine-macos] engine started (dylib: {dll}, fullscreen={})", cfg.fullscreen);
         Ok(())
+    }
+
+    /// A start that happens AFTER its caller has answered — the deferred half of a
+    /// restart, or a start queued behind a teardown. `restart()` returns `Ok` the
+    /// moment the teardown is queued, so a failure here has no return value left
+    /// to travel on: without this it was printed to the log while `running` stayed
+    /// true, leaving the tray on Ready with no engine and making the next Start a
+    /// silent no-op. Route it exactly like an engine that died on its own — the
+    /// tray's `Status::Off` + `START_FAILED` handler does the teardown and tells
+    /// the user.
+    fn start_or_report(&self, cfg: &Config) {
+        if let Err(e) = self.start_inner(cfg) {
+            eprintln!("[engine-macos] deferred start failed: {e:#}");
+            self.inner.borrow_mut().running = false;
+            crate::status::START_FAILED.store(true, Ordering::SeqCst);
+            send_status(Status::Off);
+        }
     }
 
     pub fn start(&self, cfg: &Config) -> anyhow::Result<()> {
@@ -368,11 +475,7 @@ impl Engine {
             // Not running -> nothing to tear down; honour the request immediately.
             drop(inner);
             match req {
-                Some(cfg) => {
-                    if let Err(e) = self.start_inner(&cfg) {
-                        eprintln!("[engine-macos] start: {e}");
-                    }
-                }
+                Some(cfg) => self.start_or_report(&cfg),
                 None => self.inner.borrow_mut().running = false,
             }
             return;
@@ -387,27 +490,32 @@ impl Engine {
         inner.next_cfg = req;
         inner.transitioning = true;
         // Join the engine worker off-main; ping the loop (-> on_engine_stopped) when done.
-        std::thread::spawn(move || {
+        // The handle is KEPT (not detached) so a Quit arriving mid-transition can wait
+        // for this teardown instead of exiting through it — see `stop_blocking`.
+        inner.join = Some(std::thread::spawn(move || {
             let mut ap = ap;
             ap.stop(); // airplay_core_stop: request shutdown + worker.join()
             drop(ap); // airplay_core_destroy()
             signal_engine_stopped();
-        });
+        }));
     }
 
     /// Main-thread completion of an async teardown (AppEvent::EngineStopped).
     pub fn on_engine_stopped(&self) {
-        let (queued, next) = {
+        let (queued, next, done) = {
             let mut inner = self.inner.borrow_mut();
             inner.transitioning = false;
-            (inner.queued.take(), inner.next_cfg.take())
+            (inner.queued.take(), inner.next_cfg.take(), inner.join.take())
         };
+        // The teardown thread signals us as its very last act, so this join is
+        // effectively instant — it just reaps the handle before `begin` overwrites it.
+        if let Some(h) = done {
+            let _ = h.join();
+        }
         if let Some(req) = queued {
             self.begin(req); // a newer request arrived mid-teardown — apply it now
         } else if let Some(cfg) = next {
-            if let Err(e) = self.start_inner(&cfg) {
-                eprintln!("[engine-macos] restart-start: {e}");
-            }
+            self.start_or_report(&cfg); // `begin` already set running=true for this
         }
         // else: a plain stop completed — stay stopped.
     }
@@ -416,23 +524,63 @@ impl Engine {
         self.begin(None);
     }
 
+    /// `Ok` here means "the teardown is queued", NOT "the engine is up" — the real
+    /// start happens later, on the main thread, from `on_engine_stopped`. Its
+    /// failure therefore cannot come back through this return value; it travels
+    /// the tray's failed-start path instead (see `start_or_report`).
     pub fn restart(&self, cfg: &Config) -> anyhow::Result<()> {
         self.begin(Some(cfg.clone()));
         Ok(())
     }
 
-    /// Synchronous stop for app quit only: block on the worker join (the brief pause
+    /// Synchronous stop for app quit only: wait for the engine worker (the brief pause
     /// is irrelevant at exit) so the AirPlay ports are released cleanly before the
     /// process ends — the async `stop()` would be abandoned by `process::exit`.
+    ///
+    /// The teardown runs on a HELPER thread and this one waits on a bounded flag —
+    /// `worker.join()` must never happen on the macOS main thread. It does NOT pump
+    /// the main queue while waiting: doing that from inside the tao event callback
+    /// re-enters tao's handler, which holds a non-reentrant mutex for the duration
+    /// of the callback, and self-deadlocks with no deadline able to break it (see
+    /// `wait_bounded`). Not pumping is safe because `avlayer_sink_create` dispatches
+    /// asynchronously, so the worker never waits on the main queue; if some future
+    /// path does, the cost here is a bounded delay on quit rather than a hang.
     pub fn stop_blocking(&self) {
+        let (ap, inflight) = {
+            let mut inner = self.inner.borrow_mut();
+            // Stay "transitioning" across the wait below: it makes any start/stop
+            // re-entering through the run loop queue itself instead of touching the
+            // engine we are tearing down. Cleared once the wait is over.
+            inner.transitioning = true;
+            inner.queued = None;
+            inner.next_cfg = None;
+            inner.running = false;
+            (inner.airplay.take(), inner.join.take())
+        };
+        // `inflight` is a teardown `begin()` already started (it holds the handle,
+        // so `airplay` is None here) — without waiting on it, `process::exit(0)`
+        // would run straight through GStreamer teardown / logger_destroy / dlclose.
+        if ap.is_some() || inflight.is_some() {
+            let done = std::sync::Arc::new(AtomicBool::new(false));
+            let flag = done.clone();
+            std::thread::spawn(move || {
+                if let Some(mut ap) = ap {
+                    ap.stop(); // airplay_core_stop: request shutdown + worker.join()
+                    drop(ap); // airplay_core_destroy()
+                }
+                if let Some(h) = inflight {
+                    let _ = h.join();
+                }
+                flag.store(true, Ordering::SeqCst);
+            });
+            if !wait_bounded(&done, 3.0) {
+                eprintln!("[engine-macos] stop_blocking: teardown still running after 3s, exiting anyway");
+            }
+        }
         let mut inner = self.inner.borrow_mut();
         inner.transitioning = false;
         inner.queued = None;
         inner.next_cfg = None;
-        if let Some(mut ap) = inner.airplay.take() {
-            ap.stop();
-        }
-        inner.running = false;
         CONNECTED.store(false, Ordering::SeqCst);
         if let Some(w) = inner.window.as_ref() {
             w.set_visible(false);

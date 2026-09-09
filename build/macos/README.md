@@ -1,6 +1,7 @@
 # macOS build infra
 
-Reproduces `uxplay-core.dylib` on macOS (Apple Silicon). See
+Reproduces `uxplay-core.dylib` and the render prototype-gate on macOS (Apple
+Silicon). Mirrors `build/Dockerfile.u24` (Linux). See
 [`BUILD-MACOS.md`](BUILD-MACOS.md) for the full end-to-end `.app` + DMG build.
 
 ## Toolchain (one-time)
@@ -36,8 +37,8 @@ SRC=$PWD bash /path/to/build/macos/build-core-arm64.sh     # -> build-arm64/uxpl
 
 Notes:
 - `-DGST_MACOS=OFF` keeps the `gst_macos_main` `main()` wrapper out of the dylib
-  (tao owns the NSApplication run loop). The dylib's `main()` is dead code anyway.
-- The clean-full diff ALREADY carries the gmainloop fix, the macOS overlay bind +
+  (M3: tao owns the NSApplication run loop). The dylib's `main()` is dead code anyway.
+- The clean-full diff ALREADY carries the L1 gmainloop fix, the macOS overlay bind +
   the **custom `avlayer` video sink** wiring (`video_renderer.c` appsink path,
   `renderers/CMakeLists.txt` OBJC + AV/CoreMedia/CoreVideo/QuartzCore frameworks), so
   the only extra step is copying the new `avsample_sink.m` source in (above).
@@ -49,11 +50,21 @@ Notes:
   1.29.x dev build that the buggy `avsamplebufferlayersink` needed — the stable
   **1.28.4** should work (validated live on 1.29.1; re-verify on 1.28.4 before release).
 - Universal2: brew openssl/libplist `.a` are arm64-only — the x86_64 slice needs fat
-  openssl/libplist (build from source → lipo); deferred to packaging.
+  openssl/libplist (build from source → lipo); deferred to packaging (M5/M6).
 
 Verify:
 ```bash
 nm -gU build-arm64/uxplay-core.dylib | grep airplay_core_   # 8 exports (+2 bonus)
 nm build-arm64/uxplay-core.dylib | grep -c gst_macos_main   # 0
 clang -O2 -o m1_smoke m1_smoke.c && ./m1_smoke build-arm64/uxplay-core.dylib   # PASS
+```
+
+## Prototype gate
+
+```bash
+cd /path/to/m3-smoke-mac
+cargo build --target aarch64-apple-darwin
+./target/aarch64-apple-darwin/debug/m3-smoke-mac /path/to/build-arm64/uxplay-core.dylib
+# Mirror from an iPhone; verify (a) no NSApplication-main-thread warning, (b) render
+# inside the window, (c) live-resize, (d) clean teardown on close.  PASSED 2026-06-19.
 ```

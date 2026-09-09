@@ -25,6 +25,9 @@
   <launchable type="desktop-id">com.popyachsa.AirPlay.desktop</launchable>
 
   <url type="homepage">https://airplay.popyachsa.com</url>
+  <!-- This is what GNOME Software / KDE Discover wire the "Report an Issue"
+       button to. It pointed at UxPlay upstream, so every Linux bug report about
+       THIS app landed in an unrelated project's tracker. -->
   <url type="bugtracker">https://github.com/Recluse/Popyachsa-AirPlay/issues</url>
   <url type="vcs-browser">https://github.com/Recluse/Popyachsa-AirPlay</url>
 
@@ -42,7 +45,35 @@
     </screenshot>
   </screenshots>
 
+  <!-- Newest first (AppStream requires it). Dates are the release tag's date.
+       Add an entry here on every release — Flathub's check rejects a manifest
+       whose newest <release> is older than the version being submitted. -->
   <releases>
+    <release version="0.2.13" date="2026-09-10">
+      <description>
+        <p>Pick which network adapter the receiver uses. Runs again on CPUs without AVX. Many fixes to options that could crash or silently misconfigure the receiver.</p>
+      </description>
+    </release>
+    <release version="0.2.12" date="2026-06-22">
+      <description>
+        <p>H.265 and 4K fixes: mirroring no longer drops on reconnect. Auto-updater fixes.</p>
+      </description>
+    </release>
+    <release version="0.2.11" date="2026-06-21">
+      <description>
+        <p>Noticeably sharper video on HiDPI and fractional-scaling displays.</p>
+      </description>
+    </release>
+    <release version="0.2.9" date="2026-06-21">
+      <description>
+        <p>The fullscreen shortcut no longer fires while another app is focused. About links to the source code.</p>
+      </description>
+    </release>
+    <release version="0.2.8" date="2026-06-20">
+      <description>
+        <p>Settings are saved atomically, so nothing is lost if the machine crashes mid-save. Hardened the signed auto-updater.</p>
+      </description>
+    </release>
     <release version="0.2.7" date="2026-06-19">
       <description>
         <p>Cross-platform release: Linux build, settings and self-update.</p>

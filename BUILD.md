@@ -37,11 +37,18 @@ The 8 ABI exports: `airplay_core_create`, `_set_device_name`, `_set_log_callback
 **1. Build the engine DLL** (from the MSYS2 UCRT64 shell):
 ```bash
 cd third_party/uxplay
-cmake -S . -B build -G Ninja -DBUILD_CORE_DLL=ON
+cmake -S . -B build -G Ninja -DBUILD_CORE_DLL=ON -DNO_MARCH_NATIVE=ON
 ninja -C build uxplay-core            # -> build/uxplay-core.dll
 ```
 > The optional Bonjour-proxy path of the shim needs Apple's Bonjour SDK headers
 > (`BONJOUR_SDK_HOME=...`); the embedded-mdns path needs nothing from Apple.
+
+> **Keep `-DNO_MARCH_NATIVE=ON` for anything you distribute.** Upstream defaults to
+> `-march=native`, which bakes the *build machine's* instruction set into the binary.
+> A release built without this flag died with an illegal instruction on every CPU
+> without AVX — not only pre-2011 hardware, but the Atom-derived Celeron/Pentium
+> lines (Apollo Lake, Gemini Lake) that cheap mini-PCs are built on. Drop the flag
+> only for a build that will never leave the machine that made it.
 
 **2. Build the app:**
 ```bash
@@ -80,7 +87,8 @@ mDNS is the system **Avahi** — no shim needed.
 **1. Build the engine .so:**
 ```bash
 cd third_party/uxplay
-cmake -S . -B build -G Ninja -DBUILD_CORE_DLL=ON -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+cmake -S . -B build -G Ninja -DBUILD_CORE_DLL=ON -DNO_MARCH_NATIVE=ON \
+      -DCMAKE_POSITION_INDEPENDENT_CODE=ON
 ninja -C build uxplay-core            # -> build/uxplay-core.so
 ```
 > `-DCMAKE_POSITION_INDEPENDENT_CODE=ON` is **required** — without it the static
@@ -114,7 +122,7 @@ cp third_party/uxplay/build/uxplay-core.so target/release/
 **1. Build the engine .dylib:**
 ```bash
 cd third_party/uxplay
-cmake -S . -B build -G Ninja -DBUILD_CORE_DLL=ON
+cmake -S . -B build -G Ninja -DBUILD_CORE_DLL=ON -DNO_MARCH_NATIVE=ON
 ninja -C build uxplay-core            # -> build/uxplay-core.dylib
 ```
 > macOS renders into an `NSView*` and uses a custom `AVSampleBufferDisplayLayer`

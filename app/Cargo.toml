@@ -1,6 +1,6 @@
 [package]
 name = "popyachsa-airplay"
-version = "0.2.12"
+version = "0.2.13"
 edition = "2021"
 authors = ["Popyachsa AirPlay contributors"]
 description = "AirPlay receiver for Windows, Linux and macOS — in-process patched-UxPlay engine + tray"
@@ -56,6 +56,13 @@ features = [
     "Win32_Globalization",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
+    # Adapter enumeration for the "bind to this adapter" setting. All three are
+    # needed: IP_ADAPTER_ADDRESSES_LH/GetAdaptersAddresses live in IpHelper but
+    # their OperStatus enum is in Ndis and the SOCKADDR_IN in WinSock, and the
+    # IpHelper feature does not pull either in.
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_Console",

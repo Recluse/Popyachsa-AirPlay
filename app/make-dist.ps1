@@ -21,20 +21,13 @@
 #>
 $ErrorActionPreference = 'Stop'
 
-$ROOT       = Split-Path -Parent $PSCommandPath          # the app/ crate dir
-$WS         = Split-Path -Parent $ROOT                   # the workspace root
-# cargo's release output (workspace target/). Override $env:TARGET_DIR if elsewhere.
-$TARGET     = if ($env:TARGET_DIR) { $env:TARGET_DIR } else { Join-Path $WS 'target\release' }
-$EXE_RS     = Join-Path $TARGET 'popyachsa-airplay.exe'
-$UPDATER_RS = Join-Path $TARGET 'updater.exe'
-# MSYS2 UCRT64 GStreamer runtime (see BUILD.md). Override $env:UCRT64 for a non-default install.
-$UCRT      = if ($env:UCRT64) { $env:UCRT64 } else { 'C:\msys64\ucrt64' }
-$UCRT_BIN  = Join-Path $UCRT 'bin'
-$UCRT_LIB  = Join-Path $UCRT 'lib'
-# Engine DLL built from the third_party/uxplay submodule (BUILD.md). Override $env:CORE_DLL.
-$CORE_DLL  = if ($env:CORE_DLL) { $env:CORE_DLL } else { Join-Path $WS 'third_party\uxplay\build\uxplay-core.dll' }
-# dnssd shim from the airplay-dnssd-shim repo; place it here or set $env:DNSSD_DLL.
-$DNSSD_DLL = if ($env:DNSSD_DLL) { $env:DNSSD_DLL } else { Join-Path $ROOT 'dnssd.dll' }
+$ROOT       = Split-Path -Parent $PSCommandPath
+$EXE_RS     = Join-Path $ROOT 'target\release\popyachsa-airplay.exe'
+$UPDATER_RS = Join-Path $ROOT 'target\release\updater.exe'
+$UCRT_BIN  = 'C:\msys64\ucrt64\bin'
+$UCRT_LIB  = 'C:\msys64\ucrt64\lib'
+$CORE_DLL  = 'C:\msys64\home\me\UxPlay\build\uxplay-core.dll'
+$DNSSD_DLL = 'C:\Work\GITLAB\popyachsa-airplay\uxplay\dnssd.dll'
 
 foreach ($f in @($EXE_RS, $UPDATER_RS, $CORE_DLL, $DNSSD_DLL)) {
     if (-not (Test-Path $f)) { throw "missing required file: $f" }
@@ -73,8 +66,14 @@ Write-Host "[dist] copied $($plugins.Count) GStreamer plugins"
 #    plugins pull in extra codec/runtime DLLs that uxplay-core.dll does not).
 #    The MSVC tray exe loads uxplay-core.dll dynamically, so its own import table
 #    is system-only — nothing to harvest there.
+# $ErrorActionPreference='Stop' does NOT turn a native command's non-zero exit
+# into a terminating error on Windows PowerShell 5.1, so $LASTEXITCODE has to be
+# read by hand: a failed objdump reads as "this image imports nothing", and the
+# walk then bundles a dist\ that is missing every DLL below that image.
 function Get-DllImports([string]$path) {
-    & "$UCRT_BIN\objdump.exe" -p $path 2>$null |
+    $out = & "$UCRT_BIN\objdump.exe" -p $path 2>$null
+    if ($LASTEXITCODE -ne 0) { throw "objdump failed (exit $LASTEXITCODE) on $path — the dep walk would silently skip its imports" }
+    $out |
         Select-String -Pattern '^\s+DLL Name:\s+(.+)$' |
         ForEach-Object { $_.Matches[0].Groups[1].Value.Trim() }
 }
@@ -98,7 +97,15 @@ while ($queue.Count -gt 0) {
 }
 Write-Host "[dist] bundled $($seen.Count) runtime DLLs (incl. plugin deps)"
 
-# 4. README
+# 4. Licence. GPL-3 §4 requires the licence text to travel WITH the binaries, and
+#    this tree is both the portable zip and the installer payload (the .nsi does
+#    File /r over it), so putting COPYING here covers both Windows artifacts.
+#    installer\LICENSE.txt is only the wizard's summary page — it is never installed.
+$COPYING = Join-Path $ROOT '..\packaging\shared\COPYING'
+if (-not (Test-Path $COPYING)) { throw "missing $COPYING (GPL-3 text must ship with the binaries)" }
+Copy-Item $COPYING (Join-Path $DIST 'COPYING.txt')
+
+# 5. README
 @"
 Popyachsa AirPlay — portable Windows build (in-process engine).
 
@@ -117,12 +124,13 @@ Files:
     dnssd.dll                — embedded mDNS shim (must sit next to the exe)
     *.dll                    — GStreamer + GLib + OpenSSL runtime
     lib\gstreamer-1.0\       — GStreamer plugins
+    COPYING.txt              — GNU General Public License v3 (this program's license)
     config.json              — created on first run at %APPDATA%\PopyachsaAirPlay\
 
 Open source — see About in the tray menu for credits + license details.
 "@ | Set-Content -Encoding UTF8 (Join-Path $DIST 'README.txt')
 
-# 5. Total size + zip. Archive the FOLDER itself (not its contents) so it
+# 6. Total size + zip. Archive the FOLDER itself (not its contents) so it
 #    extracts into a PopyachsaAirPlay\ folder instead of dumping loose files
 #    into wherever the user unzips.
 $sz = (Get-ChildItem -Recurse $DIST | Measure-Object Length -Sum).Sum / 1MB

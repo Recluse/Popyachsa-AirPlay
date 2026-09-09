@@ -2,14 +2,17 @@
 ; Per-user install (no administrator rights). Bundles the full in-process
 ; engine distribution produced by make-dist.ps1 (dist\PopyachsaAirPlay\).
 ;
-; Build:  makensis /DVERSION=0.2.1 installer\popyachsa-airplay.nsi
+; Build:  makensis /DVERSION=<Cargo.toml version> installer\popyachsa-airplay.nsi
 ; (run from the project root, or adjust the relative paths below).
 
 Unicode true
 !include "MUI2.nsh"
 
+; No default. A silent fallback shipped a Setup.exe stamped 0.2.1 in Add/Remove
+; Programs and in its VERSIONINFO whatever binaries were actually inside it, and
+; nothing downstream re-checks — CI signs the feed from the git tag alone.
 !ifndef VERSION
-  !define VERSION "0.2.1"
+  !error "pass /DVERSION=X.Y.Z (matching Cargo.toml) — e.g. makensis /DVERSION=0.2.12 installer\popyachsa-airplay.nsi"
 !endif
 
 !define APP        "Popyachsa AirPlay"

@@ -1,3 +1,4 @@
 [submodule "third_party/uxplay"]
 	path = third_party/uxplay
 	url = https://github.com/Recluse/UxPlay
+	branch = popyachsa-integration

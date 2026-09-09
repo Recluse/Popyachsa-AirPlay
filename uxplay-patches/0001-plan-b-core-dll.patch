@@ -1,0 +1,193 @@
+--- uxplay.cpp	2026-05-28 23:18:16.453453600 +0300
++++ uxplay.cpp	2026-05-28 23:18:39.873001700 +0300
+@@ -2860,21 +2860,12 @@
+     }
+ }
+ 
+-#ifdef GST_MACOS
+-/* workaround for GStreamer >= 1.22 "Official Builds" on macOS */
+-#include <TargetConditionals.h>
+-#include <gst/gstmacos.h>
+-void real_main (int argc, char *argv[]);
+-
+-int main (int argc, char *argv[]) {
+-    LOGI("*=== Using gst_macos_main wrapper for GStreamer >= 1.22 on macOS ===*");
+-    return  gst_macos_main ((GstMainFunc) real_main, argc, argv , NULL);
+-}
+-
+-void real_main (int argc, char *argv[]) {
+-#else
+-int main (int argc, char *argv[]) {
+-#endif
++/* PATCH (Plan B): the former body of main() is now a reusable C-ABI entry
++ * point.  It is driven either by the standalone uxplay.exe main() (defined
++ * right after this function) or by uxplay-core.dll's worker thread
++ * (lib/airplay_core.cpp).  All the file-static option/runtime globals are kept
++ * as-is: the engine is single-instance by design. */
++extern "C" int airplay_run_blocking (int argc, char *argv[]) {
+     std::vector<char> server_hw_addr;
+     std::string config_file = "";
+ 
+@@ -3267,8 +3258,46 @@
+         stop_dnssd();
+     }
+     cleanup();
++    return 0;
+ }
+- 
++
++/* PATCH (Plan B): request a clean shutdown from another thread (the DLL host).
++ * gmainloop and relaunch_video are file-statics in this TU, so the shim lives
++ * here.  Mirrors the handle_signal() path: drop the reconnect loop, then quit
++ * the running GMainLoop so airplay_run_blocking() returns. */
++extern "C" void airplay_request_shutdown (void) {
++    relaunch_video = false;
++    if (gmainloop) {
++        g_main_loop_quit(gmainloop);
++    }
++}
++
++/* PATCH (Plan B): host HWND for the renderer, set before airplay_run_blocking()
++ * by the DLL host.  renderers/video_renderer.c reads it via
++ * airplay_get_host_window() in its GstVideoOverlay block, instead of the
++ * UXPLAY_OVERLAY_HWND env var (which remains as a fallback for the exe). */
++static void *g_host_window_handle = NULL;
++extern "C" void airplay_set_host_window (void *hwnd) {
++    g_host_window_handle = hwnd;
++}
++extern "C" void *airplay_get_host_window (void) {
++    return g_host_window_handle;
++}
++
++#ifdef GST_MACOS
++/* workaround for GStreamer >= 1.22 "Official Builds" on macOS */
++#include <TargetConditionals.h>
++#include <gst/gstmacos.h>
++int main (int argc, char *argv[]) {
++    LOGI("*=== Using gst_macos_main wrapper for GStreamer >= 1.22 on macOS ===*");
++    return gst_macos_main ((GstMainFunc) airplay_run_blocking, argc, argv, NULL);
++}
++#else
++int main (int argc, char *argv[]) {
++    return airplay_run_blocking (argc, argv);
++}
++#endif
++
+ static void cleanup() {
+     if (use_audio) {
+         audio_renderer_destroy();
+--- video_renderer.c	2026-05-28 23:18:16.491726500 +0300
++++ video_renderer.c	2026-05-28 23:19:33.690239500 +0300
+@@ -26,6 +26,11 @@
+ #include <gst/video/videooverlay.h>  /* PATCH (Plan A): GstVideoOverlay HWND */
+ #include "video_renderer.h"
+ 
++/* PATCH (Plan B): host-provided renderer HWND, defined in uxplay.cpp.  When the
++ * DLL host has set one, we render into it via GstVideoOverlay instead of the
++ * UXPLAY_OVERLAY_HWND env var.  Returns NULL for the standalone exe. */
++extern void *airplay_get_host_window (void);
++
+ #define SECOND_IN_NSECS 1000000000UL
+ #define SECOND_IN_MICROSECS 1000000
+ #ifdef X_DISPLAY_FIX
+@@ -475,36 +480,45 @@
+              * than create its own window.  Lets the launcher own the WndProc
+              * and do native borderless / drag / resize / fullscreen / aspect. */
+             {
++                /* PATCH (Plan B): prefer the in-process host HWND set by the DLL
++                 * host; fall back to UXPLAY_OVERLAY_HWND env for the exe. */
++                void *host_hwnd = airplay_get_host_window();
+                 const char *hwnd_env = g_getenv("UXPLAY_OVERLAY_HWND");
+-                if (hwnd_env && *hwnd_env) {
++                guintptr hwnd = 0;
++                if (host_hwnd) {
++                    hwnd = (guintptr) host_hwnd;
++                } else if (hwnd_env && *hwnd_env) {
+                     /* Accept both decimal and 0x-prefixed hex. */
+-                    guintptr hwnd = (guintptr) g_ascii_strtoull(hwnd_env, NULL,
+-                                                                 (hwnd_env[0] == '0' && (hwnd_env[1] == 'x' || hwnd_env[1] == 'X')) ? 16 : 10);
+-                    if (hwnd) {
+-                        /* Videosink element was named "<videosink>_<codec>"
+-                         * in the launch string above (line 418-421). */
+-                        char sink_name[64];
+-                        g_snprintf(sink_name, sizeof(sink_name), "%s_%s",
+-                                   videosink, renderer_type[i]->codec);
+-                        GstElement *sink = gst_bin_get_by_name(
+-                            GST_BIN(renderer_type[i]->pipeline), sink_name);
+-                        if (sink && GST_IS_VIDEO_OVERLAY(sink)) {
+-                            gst_video_overlay_set_window_handle(
+-                                GST_VIDEO_OVERLAY(sink), hwnd);
+-                            logger_log(logger, LOGGER_INFO,
+-                                       "PLAN-A overlay: bound videosink %s to HWND 0x%" G_GINTPTR_MODIFIER "x",
+-                                       sink_name, (guintptr) hwnd);
+-                        } else {
+-                            logger_log(logger, LOGGER_ERR,
+-                                       "PLAN-A overlay: %s element missing or no GstVideoOverlay support",
+-                                       sink_name);
+-                        }
+-                        if (sink) gst_object_unref(sink);
++                    hwnd = (guintptr) g_ascii_strtoull(hwnd_env, NULL,
++                                                       (hwnd_env[0] == '0' && (hwnd_env[1] == 'x' || hwnd_env[1] == 'X')) ? 16 : 10);
++                }
++                if (hwnd) {
++                    /* Videosink element was named "<videosink>_<codec>"
++                     * in the launch string above (line 418-421). */
++                    char sink_name[64];
++                    g_snprintf(sink_name, sizeof(sink_name), "%s_%s",
++                               videosink, renderer_type[i]->codec);
++                    GstElement *sink = gst_bin_get_by_name(
++                        GST_BIN(renderer_type[i]->pipeline), sink_name);
++                    if (sink && GST_IS_VIDEO_OVERLAY(sink)) {
++                        gst_video_overlay_set_window_handle(
++                            GST_VIDEO_OVERLAY(sink), hwnd);
++                        logger_log(logger, LOGGER_INFO,
++                                   "overlay: bound videosink %s to host HWND 0x%" G_GINTPTR_MODIFIER "x (%s)",
++                                   sink_name, (guintptr) hwnd,
++                                   host_hwnd ? "in-process host" : "UXPLAY_OVERLAY_HWND env");
+                     } else {
+                         logger_log(logger, LOGGER_ERR,
+-                                   "PLAN-A overlay: UXPLAY_OVERLAY_HWND='%s' parsed to 0", hwnd_env);
++                                   "overlay: %s element missing or no GstVideoOverlay support",
++                                   sink_name);
+                     }
++                    if (sink) gst_object_unref(sink);
++                } else if (hwnd_env && *hwnd_env) {
++                    logger_log(logger, LOGGER_ERR,
++                               "overlay: UXPLAY_OVERLAY_HWND='%s' parsed to 0", hwnd_env);
+                 }
++                /* else: no host HWND and no env -> sink creates its own window
++                 * (standalone exe default; also the B2 smoke-test NULL-hwnd case) */
+             }
+             g_string_free(launch, TRUE);
+             gst_caps_unref(caps);
+--- CMakeLists.txt	2026-05-28 23:18:16.534742400 +0300
++++ CMakeLists.txt	2026-05-28 23:20:36.608652500 +0300
+@@ -65,6 +65,28 @@
+       target_link_libraries( uxplay ${DBUS_LIBRARY})
+ endif()
+ 
++# Plan B: uxplay-core.dll — the engine as an embeddable shared library with a
++# flat C ABI (lib/airplay_core.h).  Additive; off by default so normal exe
++# builds are unchanged.  Enable with -DBUILD_CORE_DLL=ON.
++option( BUILD_CORE_DLL "Build uxplay-core shared library for in-process embedding (Plan B)" OFF )
++if ( BUILD_CORE_DLL )
++  message( STATUS "Plan B: will build uxplay-core shared library" )
++  add_library( uxplay-core SHARED uxplay.cpp lib/airplay_core.cpp )
++  target_link_libraries( uxplay-core renderers airplay )
++  if (DBUS_FOUND)
++    target_link_libraries( uxplay-core ${DBUS_LIBRARY})
++  endif()
++  set_target_properties( uxplay-core PROPERTIES
++      OUTPUT_NAME   "uxplay-core"
++      PREFIX        ""          # -> uxplay-core.dll (no "lib" prefix)
++      IMPORT_PREFIX ""
++      IMPORT_SUFFIX ".dll.a" )  # -> uxplay-core.dll.a import library
++  install( TARGETS uxplay-core
++           RUNTIME DESTINATION bin
++           ARCHIVE DESTINATION lib )
++  install( FILES lib/airplay_core.h DESTINATION include )
++endif()
++
+ install( TARGETS  uxplay RUNTIME DESTINATION bin )
+ install( FILES uxplay.1 DESTINATION ${CMAKE_INSTALL_MANDIR}/man1 )
+ install( FILES README.md README.txt README.html LICENSE DESTINATION ${CMAKE_INSTALL_DOCDIR} ) 

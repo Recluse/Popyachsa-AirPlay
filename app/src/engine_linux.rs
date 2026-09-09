@@ -9,7 +9,7 @@
 //! event loop, and GTK is single-main-thread. Xlib — unlike GTK — is happy on a
 //! worker thread once `XInitThreads()` is called, so the engine keeps the same
 //! self-contained "own window + own loop on a worker thread" shape it has on
-//! Windows. Wayland is post-v1 (run under Xwayland for now; see PLAN-LINUX L4).
+//! Windows. Wayland is post-v1 — run under Xwayland for now.
 //!
 //! v1 video path: `ximagesink` (software X11 sink) + `-avdec` (software H.264) —
 //! robust on every box including headless WSL. HW decode (VA-API/NVDEC) +
@@ -172,6 +172,12 @@ fn build_options(cfg: &Config, video_sink: &str) -> String {
         "" => a.extend(["-as".into(), "fakesink".into()]),
         s => a.extend(["-as".into(), s.to_string()]),
     }
+    // Bind + advertise on ONE adapter (fork-only `-bind`). Omitted when unset so
+    // the argv tail stays byte-identical to what shipped before this setting
+    // existed. custom_flags stays last, so a hand-typed -bind there still wins.
+    if let Some(ip) = crate::net_interfaces::bind_arg(cfg.bind_ip.as_deref()) {
+        a.extend(["-bind".into(), ip.to_string()]);
+    }
     if !cfg.custom_flags.trim().is_empty() {
         for tok in cfg.custom_flags.split_whitespace() {
             a.push(tok.to_string());
@@ -197,6 +203,26 @@ extern "C" fn engine_log_cb(_level: c_int, msg: *const c_char, _user: *mut c_voi
         return;
     }
     let text = unsafe { CStr::from_ptr(msg) }.to_string_lossy();
+    // The engine gave up during startup. Nothing else will ever tell us: the C ABI
+    // called this run a success the moment the worker spawned, so without this the
+    // X11 loop keeps running, the tray keeps showing "Ready", and the receiver is
+    // simply invisible to every device. Flag it and report Off; the tray consumes
+    // the flag, does the real teardown (it owns the Engine) and tells the user.
+    if crate::status::is_fatal_start_line(&text) {
+        crate::status::START_FAILED.store(true, Ordering::SeqCst);
+        send_status(Status::Off);
+        return;
+    }
+    // The pinned adapter was gone and the engine fell back to every interface. It
+    // KEEPS RUNNING, so this changes nothing but the tray's menu text — and the
+    // resend is what gets that menu rebuilt, since the tray only rebuilds on a
+    // status event and this line lands while the engine is still starting.
+    if crate::status::is_pin_ignored_line(&text) {
+        if !crate::status::PIN_IGNORED.swap(true, Ordering::SeqCst) {
+            send_status(Status::Ready);
+        }
+        return;
+    }
     if text.contains(MARK_CONNECTED) {
         if !CONNECTED.swap(true, Ordering::SeqCst) {
             CONN_GEN.fetch_add(1, Ordering::SeqCst);
@@ -205,14 +231,14 @@ extern "C" fn engine_log_cb(_level: c_int, msg: *const c_char, _user: *mut c_voi
         CONN_GEN.fetch_add(1, Ordering::SeqCst);
     }
     // Video frame size -> fit the window to the content aspect (no black bars).
-    // Parse the *display* W,H from UxPlay's "display dimensions: w=W h=H" line:
-    // it is LOGGER_INFO (so it reaches this callback WITHOUT -d), is
+    // Parse the *display* W,H from UxPlay's "ROTATION-PROBE dims: ... w=W h=H ..."
+    // line: it is LOGGER_INFO (so it reaches this callback WITHOUT -d), is
     // codec-independent (raop_rtp_mirror, not the renderer), and re-fires on
     // rotation. The alternatives don't work for us: "begin video stream wxh" is
-    // DEBUG-only, and "video format is ... video WxH" is per-codec.
-    if text.contains("display dimensions:") {
-        // The " w=" / " h=" tokens carry the final display size; take the digits
-        // right after each.
+    // DEBUG-only, and "video format is ... video WxH" is h265-only (we run h264).
+    if text.contains("ROTATION-PROBE dims:") {
+        // The standalone " w=" / " h=" (NOT w0=/ws=/uw=/h0=/hs=) carry the final
+        // display size; take the digits right after each.
         let num_after = |key: &str| -> Option<u32> {
             text.split(key)
                 .nth(1)?
@@ -331,6 +357,9 @@ fn run_host_window(cfg: Config, running: Arc<AtomicBool>, stop_flag: Arc<AtomicB
         let xid = window as c_ulong;
         CONNECTED.store(false, Ordering::SeqCst);
         VIDEO_WH.store(0, Ordering::SeqCst);
+        // Per-run, like the two above: last run's failure / ignored-pin verdict must
+        // not outlive it, or the tray keeps warning about an adapter already fixed.
+        crate::status::reset_run_flags();
         let mut last_gen = CONN_GEN.load(Ordering::SeqCst);
         let mut last_resize = RESIZE_GEN.load(Ordering::SeqCst);
 
@@ -346,14 +375,25 @@ fn run_host_window(cfg: Config, running: Arc<AtomicBool>, stop_flag: Arc<AtomicB
             }
         };
         ap.set_log_callback(engine_log_cb, std::ptr::null_mut());
-        let _ = ap.set_device_name(&cfg.device_name);
-        let _ = ap.set_window(xid as *mut c_void); // XID -> GstVideoOverlay
-        let _ = ap.set_options(&build_options(&cfg, video_sink));
         // Open the callback gate just before start so connect markers emitted during
         // startup are honored; it is closed again at teardown before stop/destroy.
         ENGINE_ACTIVE.store(true, Ordering::SeqCst);
-        if let Err(e) = ap.start() {
-            eprintln!("[engine] start: {e}");
+        // Checked, not `let _`: a config string with an interior NUL (config.json
+        // is hand-edited) fails CString::new, and swallowing that ran the engine
+        // with NO options at all — no -bind, no sink, no fps — under a Ready tray.
+        // A failure here is the same kind of event as an engine that dies during
+        // startup, so it takes the same route: flag + Off, and the tray does the
+        // teardown (this thread must keep looping until its stop_flag is set).
+        let mut setup = || -> anyhow::Result<()> {
+            ap.set_device_name(&cfg.device_name)?;
+            ap.set_window(xid as *mut c_void)?; // XID -> GstVideoOverlay
+            ap.set_options(&build_options(&cfg, video_sink))?;
+            ap.start()
+        };
+        let started = setup();
+        if let Err(e) = &started {
+            eprintln!("[engine] start: {e:#}");
+            crate::status::START_FAILED.store(true, Ordering::SeqCst);
         }
         running.store(true, Ordering::SeqCst);
         // Engine is up and advertising (no device yet) -> tell the tray to show the
@@ -361,8 +401,8 @@ fn run_host_window(cfg: Config, running: Arc<AtomicBool>, stop_flag: Arc<AtomicB
         // icon on "Off" (grey) until a device connects, because the only later
         // status events are Connected (on connect) / Ready (on disconnect) / Off
         // (on teardown) — the initial Ready transition was never sent.
-        send_status(Status::Ready);
-        eprintln!("[engine] X11 host window 0x{xid:x} up; engine started");
+        send_status(if started.is_ok() { Status::Ready } else { Status::Off });
+        eprintln!("[engine] X11 host window 0x{xid:x} up; engine started: {}", started.is_ok());
 
         // Poll loop: drain X events, map/unmap on connect/disconnect, exit on stop.
         let mut mapped = false;

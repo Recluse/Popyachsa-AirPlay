@@ -116,29 +116,124 @@ pub fn apply(m: &Manifest) -> Result<PathBuf> {
 /// doesn't race the old one for the AirPlay ports / single-instance lock): a
 /// detached shell waits for our PID to disappear, then `open -n`s the bundle.
 pub fn relaunch_after_exit(app: &Path) {
-    let pid = std::process::id();
-    let path = app.to_string_lossy().replace('"', "\\\"");
-    let script =
-        format!("while kill -0 {pid} 2>/dev/null; do sleep 0.2; done; open -n \"{path}\"");
-    let _ = Command::new("sh").arg("-c").arg(script).spawn();
+    let pid = std::process::id().to_string();
+    let path = app.to_string_lossy().into_owned();
+    // Pass pid + path as positional argv ($1/$2) — NEVER interpolate the path into
+    // the shell string: a bundle path containing $(...), backticks, or a trailing \
+    // would otherwise be command injection or a syntax error, and the only symptom
+    // is that the app never comes back after the update. (Same fix as update_linux.)
+    let _ = Command::new("sh")
+        .arg("-c")
+        .arg(r#"while kill -0 "$1" 2>/dev/null; do sleep 0.2; done; open -n "$2""#)
+        .arg("sh") // $0
+        .arg(&pid) // $1
+        .arg(&path) // $2
+        .spawn();
+}
+
+/// Where a symlink at `base` pointing at `target` lands — `None` if that is
+/// outside `root`.
+///
+/// Resolved lexically, not with `canonicalize`: none of this exists on disk yet,
+/// and canonicalize would follow the very links we are creating. An absolute
+/// target is refused outright — a relocatable `.app` has no business containing
+/// one, so it can only be an escape attempt. The caller must additionally ensure
+/// nothing on the way in or out is itself a symlink; see `unzip`.
+fn resolve_within(root: &Path, base: &Path, target: &str) -> Option<PathBuf> {
+    use std::path::Component;
+    if Path::new(target).is_absolute() {
+        return None;
+    }
+    let normalise = |p: &Path| -> PathBuf {
+        let mut out = PathBuf::new();
+        for c in p.components() {
+            match c {
+                Component::ParentDir => {
+                    out.pop();
+                }
+                Component::CurDir => {}
+                other => out.push(other.as_os_str()),
+            }
+        }
+        out
+    };
+    // If `..` popped past the root the candidate simply stops sharing its prefix.
+    let landed = normalise(&base.join(target));
+    landed.starts_with(normalise(root)).then_some(landed)
 }
 
 /// Extract a zip blob into `dest` (pure-Rust via the `zip` crate, already a dep),
 /// preserving unix permissions so the bundle's executable + dylibs stay runnable.
 fn unzip(bytes: &[u8], dest: &Path) -> Result<()> {
+    use std::path::Component;
     let reader = std::io::Cursor::new(bytes);
     let mut zip = zip::ZipArchive::new(reader).map_err(|e| anyhow!("open zip: {e}"))?;
+    // Every symlink we have created so far. A zip escapes the lexical guard below
+    // by CHAINING links — `a -> .` then `a/b -> ..` writes `<dest>/b -> ..`, and
+    // each hop passes `resolve_within` on its own because the kernel resolves the
+    // second one THROUGH the first. The staging dir starts empty, so these are the
+    // only symlinks in the tree: a path that crosses none of them resolves exactly
+    // as `resolve_within` predicts, and every link then provably points inside.
+    // ponytail: crossing a link is refused outright rather than followed. Our zip
+    // has exactly one (Contents/Frameworks/GStreamer, make-app.sh), and nothing is
+    // stored under it. Repackaging GStreamer as a real Versions/A framework would
+    // introduce `Headers -> Versions/Current/Headers` chains and need real
+    // following here.
+    let mut links: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let crosses = |links: &std::collections::HashSet<PathBuf>, p: &Path| {
+        p.ancestors().skip(1).any(|a| links.contains(a))
+    };
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i).map_err(|e| anyhow!("zip entry {i}: {e}"))?;
-        // enclosed_name() rejects absolute / `..` paths (zip-slip safe).
+        // enclosed_name() rejects absolute paths and any prefix that climbs above
+        // the root, but it KEEPS interior `..` components (`a/../b`). Refuse them:
+        // it costs nothing (a ditto'd bundle has none) and it buys the invariant
+        // that `dest.join(rel)` is dest plus plain components.
         let Some(rel) = entry.enclosed_name() else { continue };
+        if rel.components().any(|c| matches!(c, Component::ParentDir)) {
+            bail!("zip entry {} contains `..`", rel.display());
+        }
         let out = dest.join(rel);
+        if crosses(&links, &out) {
+            bail!("zip entry {} is written through a symlink", out.display());
+        }
         if entry.is_dir() {
             std::fs::create_dir_all(&out).ok();
             continue;
         }
         if let Some(p) = out.parent() {
             std::fs::create_dir_all(p).ok();
+        }
+        // Symlinks must be recreated as symlinks. A zip stores a symlink's TARGET
+        // as the entry body, so the plain File::create path below would write
+        // `Contents/Frameworks/GStreamer` as a 22-byte text file where dyld expects
+        // a directory — the engine would never load again. make-app.sh creates
+        // exactly that link so codesign seals it as one resource instead of
+        // refusing to descend it.
+        #[cfg(unix)]
+        if entry.unix_mode().is_some_and(|m| m & 0o170000 == 0o120000) {
+            use std::io::Read;
+            let mut target = String::new();
+            entry
+                .read_to_string(&mut target)
+                .map_err(|e| anyhow!("read link {}: {e}", out.display()))?;
+            // A symlink inside an archive is an escape primitive: a LATER entry
+            // whose path goes through this link would be written wherever it
+            // points. enclosed_name() only vets the entry's own path, so the
+            // target has to be vetted here or the zip-slip guard has a back door.
+            let Some(landed) = resolve_within(dest, out.parent().unwrap_or(dest), &target) else {
+                bail!("zip symlink {} escapes the bundle", out.display());
+            };
+            // …and the target must not be reached through an earlier link either,
+            // or the lexical answer above is not the one the kernel gives.
+            if crosses(&links, &landed) {
+                bail!("zip symlink {} resolves through a symlink", out.display());
+            }
+            links.insert(out.clone());
+            let _ = std::fs::remove_file(&out);
+            std::os::unix::fs::symlink(&target, &out)
+                .map_err(|e| anyhow!("symlink {}: {e}", out.display()))?;
+            continue;
         }
         let mut f =
             std::fs::File::create(&out).map_err(|e| anyhow!("create {}: {e}", out.display()))?;
@@ -161,4 +256,55 @@ fn find_app(dir: &Path) -> Result<Option<PathBuf>> {
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The symlink guard is the only thing standing between a hostile update zip
+    /// and an arbitrary write outside the bundle, so it gets the one check.
+    #[test]
+    fn symlink_targets_may_not_leave_the_bundle() {
+        let root = Path::new("/tmp/stage/Popyachsa AirPlay.app");
+        let frameworks = root.join("Contents/Frameworks");
+        let ok = |base: &Path, t: &str| resolve_within(root, base, t).is_some();
+
+        // The real link make-app.sh creates.
+        assert!(ok(&frameworks, "../Resources/GStreamer"));
+        assert!(ok(root, "Contents/MacOS"));
+        assert!(ok(&frameworks, "./sibling"));
+
+        // Escapes.
+        assert!(!ok(&frameworks, "../../../../etc"));
+        assert!(!ok(root, "../outside"));
+        assert!(!ok(&frameworks, "/etc/passwd"));
+        assert!(!ok(&frameworks, "/"));
+        // Lands exactly on the parent of the root, not inside it.
+        assert!(!ok(root, ".."));
+    }
+
+    /// The lexical guard above is per-entry, so two links that each pass can still
+    /// compose into an escape. Verified to write `<root>/outside.txt` before the
+    /// `links` set was added to `unzip`.
+    #[test]
+    fn chained_symlinks_cannot_compose_into_an_escape() {
+        use std::io::Write;
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts: zip::write::FileOptions<()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        w.add_symlink("a", ".", opts).unwrap(); // <staging>/a -> <staging>
+        w.add_symlink("a/b", "..", opts).unwrap(); // really <staging>/b -> <root>
+        w.start_file("b/outside.txt", opts).unwrap(); // really <root>/outside.txt
+        w.write_all(b"pwned").unwrap();
+        let bytes = w.finish().unwrap().into_inner();
+
+        let root = std::env::temp_dir().join(format!("pa-escape-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let staging = root.join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        let err = unzip(&bytes, &staging).unwrap_err();
+        assert!(!root.join("outside.txt").exists(), "escaped: {err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

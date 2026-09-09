@@ -1,7 +1,8 @@
-//! Safe wrapper over `uxplay-core.dll` (Plan B AirPlay engine).
+//! Safe wrapper over the `uxplay-core` AirPlay engine's C ABI.
 //!
 //! ```no_run
 //! use airplay_lib::AirPlay;
+//! # let my_hwnd: isize = 0;   // an HWND on Windows, NSView* on macOS, XID on X11
 //! let mut ap = AirPlay::load("uxplay-core.dll")?;
 //! ap.set_device_name("Popyachsa TV")?;
 //! ap.set_window(my_hwnd as *mut _)?;          // render into OUR window

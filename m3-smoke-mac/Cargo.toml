@@ -1,0 +1,16 @@
+[package]
+name = "m3-smoke-mac"
+version = "0.1.0"
+edition = "2021"
+description = "M3 prototype-GATE: tao window + host NSView + uxplay-core.dylib (macOS)"
+license = "GPL-3.0-or-later"
+
+[[bin]]
+name = "m3-smoke-mac"
+path = "src/main.rs"
+
+[dependencies]
+airplay-lib = { path = "../airplay-lib" }
+anyhow = "1"
+tao = "0.34"
+raw-window-handle = "0.6"

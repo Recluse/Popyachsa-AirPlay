@@ -17,6 +17,8 @@ over the local Wi-Fi. Hardware-accelerated, open source, no accounts, no telemet
 - **Works where Bonjour fails** (Windows) — a bundled
   [mDNS shim](https://github.com/Recluse/AirPlay-DNS-SD-Shim) handles multi-NIC /
   WireGuard hosts where Apple's Bonjour service crashes.
+- **Pick the network adapter** — pin the receiver to one interface and it listens
+  and advertises on that network only, instead of whichever one the OS picks.
 - **Native & lightweight** — a tiny tray app; fullscreen, multi-monitor, aspect-locked
   drag/resize.
 - **16 languages**, follows your system locale.

@@ -1,5 +1,5 @@
 //! Raw FFI bindings to `uxplay-core.dll` — the embeddable UxPlay AirPlay engine
-//! (Plan B). The DLL exports a flat C ABI (see `lib/airplay_core.h` in the
+//! The library exports a flat C ABI (see `lib/airplay_core.h` in the
 //! UxPlay fork); we load it at runtime and resolve the 8 functions by name.
 //!
 //! Loading at runtime (instead of linking a `.dll.a`/`.lib`) is intentional: it

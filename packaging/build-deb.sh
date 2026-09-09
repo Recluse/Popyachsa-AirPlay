@@ -8,7 +8,10 @@
 #   PKGDIR=.../packaging/shared OUT=. bash build-deb.sh
 set -euo pipefail
 
-VERSION="${VERSION:-0.2.7}"
+# Mandatory, like BIN/SO/PKGDIR below: the old `${VERSION:-0.2.7}` default meant
+# a forgotten VERSION= silently stamped 0.2.7 into the control file AND the .deb
+# filename, and nothing downstream cross-checks either against the binary.
+VERSION="${VERSION:?set VERSION=X.Y.Z (must match Cargo.toml)}"
 BIN="${BIN:?set BIN=path to release popyachsa-airplay}"
 SO="${SO:?set SO=path to release uxplay-core.so}"
 PKGDIR="${PKGDIR:?set PKGDIR=path to packaging/shared}"
@@ -27,6 +30,11 @@ ln -s ../lib/popyachsa-airplay/popyachsa-airplay "$ROOT/usr/bin/popyachsa-airpla
 install -Dm644 "$PKGDIR/$APPID.desktop"      "$ROOT/usr/share/applications/$APPID.desktop"
 install -Dm644 "$PKGDIR/$APPID.png"          "$ROOT/usr/share/icons/hicolor/256x256/apps/$APPID.png"
 install -Dm644 "$PKGDIR/$APPID.metainfo.xml" "$ROOT/usr/share/metainfo/$APPID.metainfo.xml"
+# GPL-3 §4: every recipient of a binary must get a copy of the licence. Also what
+# lintian's no-copyright-file check wants at this exact path.
+# ponytail: the plain licence text, not a DEP-5 machine-readable copyright file —
+# write the DEP-5 header if this ever goes to a Debian archive rather than our repo.
+install -Dm644 "$PKGDIR/COPYING" "$ROOT/usr/share/doc/popyachsa-airplay/copyright"
 
 # Linked-library deps via dpkg-shlibdeps (libgstreamer/gtk/avahi/xdo/… with the
 # correct t64 names for the build distro). Needs a minimal debian/control stub.
@@ -56,7 +64,7 @@ cat > "$ROOT/DEBIAN/control" <<EOF
 Package: popyachsa-airplay
 Version: $VERSION
 Architecture: amd64
-Maintainer: Recluse <me@recluse.lol>
+Maintainer: Recluse <me@recluse.ru>
 Installed-Size: $INSTALLED
 Depends: $DEPS
 Recommends: gstreamer1.0-vaapi

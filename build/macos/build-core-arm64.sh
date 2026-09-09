@@ -14,8 +14,7 @@
 #  * static openssl/libplist come from Homebrew (arm64-only) -> arm64 slice only.
 set -euo pipefail
 
-# UxPlay engine source = the third_party/uxplay submodule (see BUILD.md). Override $SRC if elsewhere.
-SRC="${SRC:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/third_party/uxplay}"
+SRC="${SRC:-$HOME/uxplay-mac-build/UxPlay}"
 ARCH="${ARCH:-arm64}"
 BUILD="$SRC/build-$ARCH"
 FRAMEWORK=/Library/Frameworks/GStreamer.framework

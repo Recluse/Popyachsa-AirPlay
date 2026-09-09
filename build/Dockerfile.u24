@@ -1,0 +1,44 @@
+# Modern Linux build environment for Popyachsa AirPlay (cross-platform port).
+#
+# Ubuntu 24.04 LTS  =  GStreamer 1.24 (mature `va` HW-decode plugins), glibc 2.39,
+# modern toolchain. Use this image for:
+#   - compiling uxplay-core.so (C/CMake) + the Rust tray app,
+#   - building the .deb,
+#   - testing the build against a modern GStreamer (HW decode still needs a real
+#     GPU on the runner — absent on `mine`; that part is for community testers).
+#
+# NOT for AppImage: AppImage wants the OLDEST practical glibc for forward-compat,
+# so its image is a SEPARATE base (Ubuntu 20.04 host / Dockerfile.appimage — TBD).
+#
+# Build (on the `mine` Docker host):
+#   cat Dockerfile.u24 | ssh mine 'sudo docker build -t popyachsa-build:u24 -'
+# Use (mount the repo):
+#   ssh mine 'sudo docker run --rm -v /path/to/repo:/src popyachsa-build:u24 \
+#             bash -lc "cd /src/... && cargo build --release"'
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV RUSTUP_HOME=/opt/rust CARGO_HOME=/opt/cargo
+ENV PATH=/opt/cargo/bin:$PATH
+
+# Build tools + UxPlay core deps + GStreamer 1.24 (base/good/bad incl. `va`) +
+# GUI deps for tao/tray-icon/eframe (GTK3, ayatana-appindicator, X11, Wayland).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential cmake ninja-build pkg-config git curl ca-certificates \
+      libssl-dev libplist-dev libavahi-compat-libdnssd-dev \
+      libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+      gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+      gstreamer1.0-libav gstreamer1.0-x gstreamer1.0-tools \
+      libgtk-3-dev libxdo-dev libayatana-appindicator3-dev libx11-dev libwayland-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Rust via rustup into a world-readable prefix so any UID mounted into the
+# container can use it (we mount the repo and build as an arbitrary user).
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --profile minimal --default-toolchain stable \
+    && chmod -R a+rX /opt/rust /opt/cargo
+
+RUN gst-inspect-1.0 --version && rustc --version && cmake --version | head -1
+
+WORKDIR /src
+CMD ["/bin/bash"]

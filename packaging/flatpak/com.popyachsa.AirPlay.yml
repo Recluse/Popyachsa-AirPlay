@@ -22,7 +22,7 @@ finish-args:
   # mDNS: no portal exists (2024-2026). libavahi-compat-libdnssd talks to the host
   # Avahi over D-Bus — a NARROW talk-name, never --socket=system-bus (Flathub rejects).
   # Host MUST run avahi-daemon. NB: glibc/NSS .local->IP doesn't cross the sandbox;
-  # resolve via Avahi (PLAN-LINUX L9).
+  # resolve via Avahi.
   - --system-talk-name=org.freedesktop.Avahi
 
 build-options:

@@ -6,7 +6,7 @@
 # a DOWNLOADED copy is quarantined -> first launch needs right-click -> Open.
 set -euo pipefail
 
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 APPDIR="$REPO/app"
 VERSION="${VERSION:-$(grep -m1 '^version' "$APPDIR/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')}"
 OUT="$REPO/build/macos/dist"

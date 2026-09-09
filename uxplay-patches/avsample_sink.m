@@ -1,25 +1,4 @@
-/*
- * UxPlay - An open-source AirPlay mirroring server
- * Copyright (C) 2021-24 F. Duncanh
- * uxplay-core embeddable-library additions
- * Copyright (C) 2026 Recluse
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 3 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software Foundation,
- * Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
- */
-
-// avsample_sink.m — custom macOS video sink.
+// avsample_sink.m — custom macOS video sink (Plan B).
 //
 // Bypasses GStreamer's buggy applemedia sinks (avsamplebufferlayersink UAF on
 // caps-change, osxvideosink teardown deadlock): we pull decoded NV12 frames from
@@ -44,16 +23,27 @@ void  avlayer_sink_enqueue_nv12(void *sink, const unsigned char *y, unsigned lon
 void  avlayer_sink_destroy(void *sink);
 
 typedef struct AVLayerSink {
-    void *layer; // CFBridgingRetain'd AVSampleBufferDisplayLayer
+    // CFBridgingRetain'd AVSampleBufferDisplayLayer. _Atomic because create()
+    // publishes it from the main queue while the GStreamer streaming thread is
+    // already calling enqueue().
+    _Atomic(void *) layer;
 } AVLayerSink;
 
-/// Create the display layer and host it in `nsview` (on the main thread).
+/// Create the display layer and host it in `nsview` (AppKit work on the main thread).
+///
+/// MUST NOT dispatch_sync to the main queue — same hazard as destroy() below: this
+/// runs on the engine worker, and a host that quits mid-connect blocks its main
+/// thread inside airplay_core_stop() joining that worker, so a sync hop would
+/// deadlock with no window and no tray. So: inline if already on main, else
+/// fire-and-forget. The caller only needs the AVLayerSink handle (it is appsink
+/// callback userdata); enqueue() drops the first frames until `layer` is published,
+/// which is a few ms at stream start and invisible.
 void *avlayer_sink_create(void *nsview_ptr) {
     if (!nsview_ptr) return NULL;
     AVLayerSink *s = (AVLayerSink *)calloc(1, sizeof(AVLayerSink));
     if (!s) return NULL;
     NSView *view = (__bridge NSView *)nsview_ptr;
-    dispatch_sync(dispatch_get_main_queue(), ^{
+    void (^build)(void) = ^{
         AVSampleBufferDisplayLayer *layer = [[AVSampleBufferDisplayLayer alloc] init];
         layer.videoGravity = AVLayerVideoGravityResizeAspect; // honest aspect, letterbox
         view.wantsLayer = YES;
@@ -65,7 +55,12 @@ void *avlayer_sink_create(void *nsview_ptr) {
         layer.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
         [backing addSublayer:layer];
         s->layer = (void *)CFBridgingRetain(layer);
-    });
+    };
+    if ([NSThread isMainThread]) {
+        build();
+    } else {
+        dispatch_async(dispatch_get_main_queue(), build);
+    }
     return s;
 }
 
@@ -85,10 +80,16 @@ void avlayer_sink_enqueue_nv12(void *sink_, const unsigned char *y, unsigned lon
     }
 
     CVPixelBufferRef pb = NULL;
-    NSDictionary *attrs = @{ (id)kCVPixelBufferIOSurfacePropertiesKey : @{} };
-    CVReturn rc = CVPixelBufferCreate(kCFAllocatorDefault, width, height,
-                                      kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-                                      (__bridge CFDictionaryRef)attrs, &pb);
+    CVReturn rc;
+    // The caller is a GStreamer streaming thread, which has no autorelease pool of
+    // its own: an autoreleased literal there is held until the thread dies. Only
+    // this dictionary is autorelease-prone, so scope a pool around just it.
+    @autoreleasepool {
+        NSDictionary *attrs = @{ (id)kCVPixelBufferIOSurfacePropertiesKey : @{} };
+        rc = CVPixelBufferCreate(kCFAllocatorDefault, width, height,
+                                 kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                                 (__bridge CFDictionaryRef)attrs, &pb);
+    }
     if (rc != kCVReturnSuccess || !pb) return;
 
     if (CVPixelBufferLockBaseAddress(pb, 0) != kCVReturnSuccess) {
@@ -135,28 +136,35 @@ void avlayer_sink_enqueue_nv12(void *sink_, const unsigned char *y, unsigned lon
 /// while the main thread is blocked inside airplay_core_stop() joining that very
 /// worker (X-button restart) — a sync hop would deadlock. So we run inline if we
 /// are already on main, else fire-and-forget via dispatch_async. The block only
-/// captures `layer_ref` (already detached from `s`), so freeing `s` immediately is
-/// safe (single CFBridgingRelease transfers ownership exactly once).
+/// captures `s`, whose ownership passes to the block (single CFBridgingRelease
+/// transfers the layer exactly once).
 ///   * On restart the async cleanup drains FIFO before the next create() bind (the
 ///     serial main queue + distinct CALayer instances keep the layer tree correct).
 ///   * On app quit the process exit()s before the main queue drains again, so the
 ///     block is simply abandoned — harmless, teardown at exit is moot.
+///
+/// Reading `s->layer` and freeing `s` happen INSIDE the block, not before it:
+/// create() may still have its own block queued ahead of ours, so the layer only
+/// exists once that has run, and an earlier free() would let it write freed memory.
+/// The serial main queue gives us that ordering because create() and destroy() are
+/// always called from the same thread (the engine worker, or main in standalone
+/// uxplay) — the pairing that video_renderer.c enforces.
 void avlayer_sink_destroy(void *sink_) {
     AVLayerSink *s = (AVLayerSink *)sink_;
     if (!s) return;
-    void *layer_ref = s->layer;
-    s->layer = NULL;
-    if (layer_ref) {
-        void (^cleanup)(void) = ^{
+    void (^cleanup)(void) = ^{
+        void *layer_ref = s->layer;
+        s->layer = NULL;
+        if (layer_ref) {
             AVSampleBufferDisplayLayer *layer = (AVSampleBufferDisplayLayer *)CFBridgingRelease(layer_ref);
             [layer flush];
             [layer removeFromSuperlayer];
-        };
-        if ([NSThread isMainThread]) {
-            cleanup();
-        } else {
-            dispatch_async(dispatch_get_main_queue(), cleanup);
         }
+        free(s);
+    };
+    if ([NSThread isMainThread]) {
+        cleanup();
+    } else {
+        dispatch_async(dispatch_get_main_queue(), cleanup);
     }
-    free(s);
 }

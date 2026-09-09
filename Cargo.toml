@@ -8,3 +8,6 @@
 [workspace]
 resolver = "2"
 members = ["app", "airplay-lib", "airplay-lib-sys"]
+# Standalone render smoke-test for the macOS port: its own workspace, built by
+# hand against a freshly built dylib (see build/macos/README.md).
+exclude = ["m3-smoke-mac"]

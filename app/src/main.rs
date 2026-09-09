@@ -14,11 +14,11 @@
 //! 2. **Surface state via the tray icon** (off / ready / connected). The menu
 //!    offers Start / Stop / Restart / Always-on-top / Settings… / open logs /
 //!    About / Quit. (Per-stream "connected" detection returns once the engine
-//!    status callback is wired to UxPlay connection events.)
+//!    status callback is wired to UxPlay connection events — B4/B5 follow-up.)
 //!
 //! 3. **Own the renderer window natively.** Because the window is ours, the
 //!    chrome work (borderless / drag / aspect-resize / fullscreen / snap / PiP)
-//!    is plain Win32 in our own WndProc, not cross-process poking.
+//!    is plain Win32 in our own WndProc (stage B5), not cross-process poking.
 //!
 //! # Sub-windows
 //!
@@ -51,6 +51,7 @@ mod engine;
 mod fonts;
 mod i18n;
 mod monitors;
+mod net_interfaces;
 mod settings_ui;
 mod status;
 /// Per-OS in-process self-update, exposed under one module name so the call sites
@@ -110,6 +111,8 @@ enum AppEvent {
     Tray(TrayIconEvent),
     ConfigChanged, // config.json was edited externally; reload + restart engine
     UpdateChecked(UpdateOutcome, bool), // result of an update check; bool = user-initiated
+    #[cfg(not(windows))]
+    UpdateApplied(Option<std::path::PathBuf>), // install finished off-main; Some = relaunch this
     #[cfg(target_os = "macos")]
     MirrorAspectChanged, // iPhone rotated mid-stream -> re-fit the mirror window
     #[cfg(target_os = "macos")]
@@ -149,7 +152,22 @@ fn status_word(lang: i18n::Lang, status: Status) -> &'static str {
 fn build_menu(running: bool, status: Status, topmost: bool, lang: i18n::Lang) -> (Menu, MenuIds) {
     let t = i18n::s(lang);
     let menu = Menu::new();
-    let status_item = MenuItem::new(format!("● {}", status_word(lang, status)), false, None);
+    // A stopped engine that stopped because it FAILED says so right here. This is
+    // the whole notification on Windows (see `user_notify`), so it is not
+    // decoration: without it a failed start is indistinguishable from a Stop the
+    // user asked for.
+    let status_line = if !running && ENGINE_FAILED.load(Ordering::Relaxed) {
+        format!("● {} — {}", status_word(lang, status), t.err_engine_title)
+    } else if running && crate::status::PIN_IGNORED.load(Ordering::Relaxed) {
+        // Running, but not the way the user set it up: the pinned adapter was gone
+        // and the engine is listening everywhere. Settings still shows their pick
+        // and re-saving it would not even restart the engine (the value did not
+        // change), so this line is the only thing that can tell them.
+        format!("● {} — {}", status_word(lang, status), t.warn_pin_ignored)
+    } else {
+        format!("● {}", status_word(lang, status))
+    };
+    let status_item = MenuItem::new(status_line, false, None);
     let start_stop_item = MenuItem::new(if running { t.stop } else { t.start }, true, None);
     // Restart is only meaningful while the engine is running -- grey it out when
     // we are stopped so the menu mirrors the actual valid action.
@@ -257,6 +275,69 @@ fn open_settings_window(children: &Arc<Mutex<Vec<std::process::Child>>>) -> Resu
     Ok(())
 }
 
+/// Re-read config.json for a Start/Restart, keeping the last-known-good copy if
+/// the file will not parse. Substituting `Config::default()` there would restart
+/// the engine unpinned, under the default AirPlay name, on every adapter — a
+/// silent downgrade the user cannot see and did not ask for.
+fn reload_config(cfg: &Mutex<Config>) -> Config {
+    Config::try_load().unwrap_or_else(|e| {
+        eprintln!("[config] {e:#}; keeping the last-known-good config");
+        cfg.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    })
+}
+
+/// Linux/macOS: the same unobtrusive toast the update flow uses — the desktop
+/// files it away in its own notification centre and nothing is blocked.
+///
+/// Windows: DELIBERATELY SILENT, not a gap waiting to be filled. This app has no
+/// unobtrusive channel there (no toast path at all), and the only thing it does
+/// have — the update flow's `msgbox_info` — is a modal that steals focus and
+/// blocks the tray thread until someone clicks it. That is worse than silence.
+/// The tray itself carries the news instead: the icon goes Off and the menu's
+/// status line says why (see [`build_menu`]). Do not "fix" this by adding a
+/// message box.
+fn user_notify(summary: &str, body: &str) {
+    #[cfg(not(windows))]
+    update_linux::notify(summary, body);
+    #[cfg(windows)]
+    let _ = (summary, body);
+}
+
+/// Latches "the engine is in the failed state" so a failure that repeats — the
+/// config watcher restarting on every save while the pinned adapter is still
+/// missing, or an autostart that keeps being retried — costs ONE notification,
+/// not one per attempt. Any successful start clears it, so the next real failure
+/// is heard again.
+static ENGINE_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// Single exit for every engine start/restart: log as before, and on the
+/// transition INTO failure also tell the user, because otherwise the tray just
+/// sits on "off" with the reason buried in a log nobody opens.
+///
+/// `user_initiated` is the tray's Start/Restart: someone just clicked and is
+/// waiting for an answer, so they get one even when the latch is already set.
+fn report_engine_start(result: Result<()>, what: &str, cfg: &Config, user_initiated: bool) {
+    let Err(e) = result else {
+        ENGINE_FAILED.store(false, Ordering::SeqCst);
+        return;
+    };
+    eprintln!("{what}: {e:#}");
+    let first = !ENGINE_FAILED.swap(true, Ordering::SeqCst);
+    if !cfg.notify_on_engine_error || !(first || user_initiated) {
+        return;
+    }
+    let t = i18n::s(i18n::Lang::from_config(&cfg.language));
+    // A pinned adapter is the one cause the user can actually fix, and the fix is
+    // in Settings — so name the address instead of making them guess which of
+    // their NICs the config points at. `bind_arg` (not the raw field) because a
+    // value it rejects was never passed to the engine and cannot be the cause.
+    let body = match net_interfaces::bind_arg(cfg.bind_ip.as_deref()) {
+        Some(ip) => t.err_engine_bind.replace("{ip}", ip),
+        None => t.err_engine_body.to_string(),
+    };
+    user_notify(t.err_engine_title, &body);
+}
+
 /// Run an update check on a worker thread; report the result back to the event
 /// loop (which owns the engine and does the quit-and-swap). `user_initiated`
 /// controls whether "up to date" / "failed" are surfaced — auto-checks stay
@@ -272,6 +353,36 @@ fn spawn_update_check(proxy: tao::event_loop::EventLoopProxy<AppEvent>, user_ini
             }
         };
         let _ = proxy.send_event(AppEvent::UpdateChecked(outcome, user_initiated));
+    });
+}
+
+/// Download + verify + install the update on a worker thread, then hand the
+/// result back to the event loop, which owns the engine and does the
+/// quit-and-relaunch. Same shape as [`spawn_update_check`] and for the same
+/// reason: `apply()` is a ~100 MB blocking download plus a sha256 and an unzip,
+/// and running it inline on the tao thread freezes the tray for its whole
+/// duration — on macOS it also stops draining the main dispatch queue, which
+/// stalls a live mirror (the engine worker marshals NSView work onto it).
+#[cfg(not(windows))]
+fn spawn_update_apply(proxy: tao::event_loop::EventLoopProxy<AppEvent>, m: update::Manifest) {
+    // Off-main means the menu item stays clickable while the install runs, which
+    // the old inline version made impossible. Two of these would download into
+    // the same staging directory and unzip over each other, so: one at a time.
+    static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+    if IN_FLIGHT.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(move || {
+        let installed = match update_linux::apply(&m) {
+            Ok(path) => Some(path),
+            Err(e) => {
+                eprintln!("[update] apply: {e}");
+                None
+            }
+        };
+        // Only matters on the failure path — a success exits the process.
+        IN_FLIGHT.store(false, Ordering::SeqCst);
+        let _ = proxy.send_event(AppEvent::UpdateApplied(installed));
     });
 }
 
@@ -447,6 +558,23 @@ fn main() -> Result<()> {
 
     // Sub-windows spawned from the tray each own their own event loop.
     let args: Vec<String> = std::env::args().collect();
+    // Diagnostic: exactly what the adapter dropdown sees. Bug reports about that
+    // setting are unanswerable without it. Must run BEFORE the single-instance
+    // guard below — the tray is normally already running when you need this.
+    if args.iter().any(|a| a == "--list-interfaces") {
+        // Windows release builds are GUI-subsystem (see `windows_subsystem` at the
+        // top of this file), so the process starts with no console and println!
+        // would go nowhere — on the very platform where multi-NIC Bonjour trouble
+        // is most common. Borrow the launching shell's console; failure just means
+        // there wasn't one (double-clicked), and the diagnostic is a no-op as before.
+        #[cfg(windows)]
+        unsafe {
+            use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+            let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+        }
+        for i in net_interfaces::list() { println!("{}\t{}", i.name, i.ip); }
+        return Ok(());
+    }
     if !args.iter().any(|a| a == "--settings" || a == "--about") {
         if !acquire_tray_single_instance() {
             eprintln!("[popyachsa-airplay] another tray instance is already running");
@@ -455,7 +583,22 @@ fn main() -> Result<()> {
     }
     if args.iter().any(|a| a == "--settings") {
         std::fs::create_dir_all(data_dir()).ok();
-        let cfg = Config::load();
+        // Never open Settings over a config we could not parse: the UI would
+        // render all-defaults and the first Save would replace the user's real
+        // file with them. Bail with the parse error and the path to fix. This
+        // child returns before redirect_stdio_to_log, and on Windows it is
+        // GUI-subsystem, so a message box is the only diagnostic that reaches
+        // the user there.
+        let cfg = match Config::try_load() {
+            Ok(c) => c,
+            Err(e) => {
+                let msg = format!("{:#}\n\n{}", e, config::config_path().display());
+                eprintln!("[settings] {msg}");
+                #[cfg(windows)]
+                msgbox_info(&msg, APP_NAME);
+                return Ok(());
+            }
+        };
         if let Err(e) = settings_ui::run(cfg) {
             eprintln!("[settings_ui] {e}");
         }
@@ -474,6 +617,10 @@ fn main() -> Result<()> {
     redirect_stdio_to_log();
 
     // One-shot migration from the pre-rename folder %APPDATA%\PopyachsaTV.
+    // Windows-only on purpose: "PopyachsaTV" only ever shipped on Windows, and
+    // off Windows this block is dead code anyway — redirect_stdio_to_log() above
+    // has just created <data_dir>/logs, so `!new_dir.exists()` can never hold.
+    #[cfg(windows)]
     {
         let new_dir = data_dir();
         let old_dir = config::legacy_data_dir();
@@ -623,9 +770,7 @@ fn main() -> Result<()> {
     #[cfg(not(target_os = "macos"))]
     if cfg.lock().unwrap_or_else(|e| e.into_inner()).autostart_on_app_launch {
         let c = cfg.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        if let Err(e) = engine.start(&c) {
-            eprintln!("[engine] autostart failed: {e}");
-        }
+        report_engine_start(engine.start(&c), "[engine] autostart failed", &c, false);
     }
 
     // Quiet auto-check for a newer signed build (config-gated). Windows prompts
@@ -656,13 +801,14 @@ fn main() -> Result<()> {
                 // exist yet). Done before build_menu so it reflects running state.
                 #[cfg(target_os = "macos")]
                 {
+                    let c = cfg.lock().unwrap().clone();
+                    // No NSView means every later start fails too, so this counts
+                    // as an engine start failure and is reported like one.
                     if let Err(e) = engine.attach_window(event_target) {
-                        eprintln!("[engine-macos] attach_window failed: {e}");
-                    } else if cfg.lock().unwrap().autostart_on_app_launch {
-                        let c = cfg.lock().unwrap().clone();
-                        if let Err(e) = engine.start(&c) {
-                            eprintln!("[engine-macos] autostart failed: {e}");
-                        }
+                        report_engine_start(Err(e), "[engine-macos] attach_window failed", &c, false);
+                    } else if c.autostart_on_app_launch {
+                        report_engine_start(engine.start(&c),
+                                            "[engine-macos] autostart failed", &c, false);
                     }
                 }
                 current_status = if engine.is_running() { Status::Ready } else { Status::Off };
@@ -690,6 +836,22 @@ fn main() -> Result<()> {
                 };
                 match app_ev {
                     AppEvent::StatusChanged(s) => {
+                        // An Off carrying the engine's fatal-start flag is a
+                        // FAILURE, not the user's Stop. The engine worker already
+                        // died on its own, but nothing clears the running flag on
+                        // that path, so the teardown has to happen here — this is
+                        // the thread that owns the Engine on every OS — or the tray
+                        // keeps offering Stop/Restart for an engine that is gone
+                        // and the next Start silently no-ops.
+                        if s == Status::Off
+                            && crate::status::START_FAILED.swap(false, Ordering::SeqCst)
+                        {
+                            engine.stop();
+                            let c = cfg.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                            report_engine_start(
+                                Err(anyhow::anyhow!("the engine reported a fatal start error")),
+                                "[engine] start failed", &c, false);
+                        }
                         current_status = s;
                         // macOS: show the mirror window while a device streams,
                         // hide it otherwise (engine reports over this channel).
@@ -729,13 +891,13 @@ fn main() -> Result<()> {
                                 engine.stop();
                                 current_status = Status::Off;
                             } else {
-                                let new_cfg = Config::load();
+                                let new_cfg = reload_config(&cfg);
                                 *cfg.lock().unwrap_or_else(|e| e.into_inner()) = new_cfg.clone();
-                                if let Err(e) = engine.start(&new_cfg) {
-                                    eprintln!("[engine] start: {e}");
-                                } else {
+                                let started = engine.start(&new_cfg);
+                                if started.is_ok() {
                                     current_status = Status::Ready;
                                 }
+                                report_engine_start(started, "[engine] start", &new_cfg, true);
                             }
                             let (m, new_ids) = build_menu(engine.is_running(), current_status,
                                                       always_on_top.load(Ordering::Relaxed), current_lang);
@@ -750,18 +912,24 @@ fn main() -> Result<()> {
                             {
                                 let mut c = cfg.lock().unwrap_or_else(|e| e.into_inner());
                                 c.always_on_top = new;
-                                let _ = c.save();
+                                // `save` refuses to write over a config.json that
+                                // will not parse (this `c` would be all-defaults
+                                // then). The toggle still applies live; it just
+                                // does not outlive the session until the file is
+                                // fixed, and the log says which.
+                                if let Err(e) = c.save() {
+                                    eprintln!("[config] {e:#}");
+                                }
                             }
                             let (m, new_ids) = build_menu(engine.is_running(),
                                                           current_status, new, current_lang);
                             *ids_ref = new_ids;
                             tray.set_menu(Some(Box::new(m)));
                         } else if id == &ids_ref.restart {
-                            let new_cfg = Config::load();
+                            let new_cfg = reload_config(&cfg);
                             *cfg.lock().unwrap_or_else(|e| e.into_inner()) = new_cfg.clone();
-                            if let Err(e) = engine.restart(&new_cfg) {
-                                eprintln!("[engine] restart: {e}");
-                            }
+                            report_engine_start(engine.restart(&new_cfg),
+                                                "[engine] restart", &new_cfg, true);
                             current_status = if engine.is_running() { Status::Ready } else { Status::Off };
                         } else if id == &ids_ref.settings {
                             if let Err(e) = open_settings_window(&sub_windows) {
@@ -801,7 +969,17 @@ fn main() -> Result<()> {
                     AppEvent::Tray(_ev) => { /* left-click could open menu later */ }
                     AppEvent::ConfigChanged => {
                         eprintln!("[popyachsa-airplay] config.json changed -- reloading");
-                        let new_cfg = Config::load();
+                        // A file we cannot parse is not a config change: keep the
+                        // running config untouched and apply nothing. (The watcher
+                        // fires on every write, so it also sees a save caught
+                        // mid-rename; the next tick picks up the fixed file.)
+                        let new_cfg = match Config::try_load() {
+                            Ok(c) => c,
+                            Err(e) => {
+                                eprintln!("[config] {e:#}; ignoring this change");
+                                return;
+                            }
+                        };
                         autostart::sync(new_cfg.autostart_with_windows);
                         // Live-applicable settings apply WITHOUT a restart.
                         always_on_top.store(new_cfg.always_on_top, Ordering::Relaxed);
@@ -819,12 +997,27 @@ fn main() -> Result<()> {
                                 || old.audio_sink != new_cfg.audio_sink
                                 || old.debug_logging != new_cfg.debug_logging
                                 || old.custom_flags != new_cfg.custom_flags
+                                // Which sockets get bound is decided at engine
+                                // start, so a restart is the only way to apply it.
+                                || old.bind_ip != new_cfg.bind_ip
+                                // Window geometry is read ONCE when the engine
+                                // creates its renderer window (engine*.rs), so
+                                // these three are restart-only too — without them
+                                // the Settings checkboxes silently do nothing
+                                // until the next full app launch.
+                                || old.fullscreen != new_cfg.fullscreen
+                                || old.borderless != new_cfg.borderless
+                                || old.preferred_monitor != new_cfg.preferred_monitor
                         };
                         *cfg.lock().unwrap_or_else(|e| e.into_inner()) = new_cfg.clone();
                         if needs_restart && engine.is_running() {
-                            if let Err(e) = engine.restart(&new_cfg) {
-                                eprintln!("[engine] restart on config change: {e}");
-                            }
+                            // Not "user initiated" even though a Settings save is
+                            // usually behind it: the watcher also fires on every
+                            // external edit, so the latch is what keeps a config
+                            // the engine keeps rejecting to one notification.
+                            report_engine_start(engine.restart(&new_cfg),
+                                                "[engine] restart on config change",
+                                                &new_cfg, false);
                         }
                         // Language may have changed in Settings — re-resolve.
                         current_lang = i18n::Lang::from_config(&new_cfg.language);
@@ -877,23 +1070,11 @@ fn main() -> Result<()> {
                                             &format!("{} v{} — {}", t.upd_available, m.version, t.check_updates));
                                     } else {
                                         // Manual: clicking the menu item is the consent. Delta-
-                                        // update (full-download fallback), verify, relaunch.
+                                        // update (full-download fallback), verify, relaunch —
+                                        // off-main, results come back as AppEvent::UpdateApplied.
                                         update_linux::notify(t.upd_title,
                                             &format!("{} v{}", t.upd_available, m.version));
-                                        match update_linux::apply(&m) {
-                                            Ok(path) => {
-                                                *stop_flag.lock().unwrap_or_else(|e| e.into_inner()) = true;
-                                                engine.stop_blocking(); // sync teardown before exit
-                                                kill_all_children(&sub_windows);
-                                                update_linux::relaunch_after_exit(&path);
-                                                *control_flow = ControlFlow::Exit;
-                                                std::process::exit(0);
-                                            }
-                                            Err(e) => {
-                                                eprintln!("[update] apply: {e}");
-                                                update_linux::notify(t.upd_title, t.upd_failed);
-                                            }
-                                        }
+                                        spawn_update_apply(proxy.clone(), m);
                                     }
                                 }
                             }
@@ -915,6 +1096,21 @@ fn main() -> Result<()> {
                             }
                         }
                     }
+                    // The worker finished installing: do the parts that must run on
+                    // the thread owning the engine — teardown, children, relaunch.
+                    #[cfg(not(windows))]
+                    AppEvent::UpdateApplied(installed) => match installed {
+                        Some(path) => {
+                            *stop_flag.lock().unwrap_or_else(|e| e.into_inner()) = true;
+                            engine.stop_blocking(); // sync teardown before exit
+                            kill_all_children(&sub_windows);
+                            update_linux::relaunch_after_exit(&path);
+                            *control_flow = ControlFlow::Exit;
+                            std::process::exit(0);
+                        }
+                        None => update_linux::notify(i18n::s(current_lang).upd_title,
+                                                     i18n::s(current_lang).upd_failed),
+                    },
                 }
             }
             // X on the mirror window: INTERRUPT the current connection but keep the
@@ -926,9 +1122,8 @@ fn main() -> Result<()> {
             #[cfg(target_os = "macos")]
             Event::WindowEvent { event: tao::event::WindowEvent::CloseRequested, .. } => {
                 let c = cfg.lock().unwrap().clone();
-                if let Err(e) = engine.restart(&c) {
-                    eprintln!("[engine-macos] restart on window close: {e}");
-                }
+                report_engine_start(engine.restart(&c),
+                                    "[engine-macos] restart on window close", &c, false);
                 current_status = if engine.is_running() { Status::Ready } else { Status::Off };
                 if let (Some(tray), Some(ids_ref)) = (tray_icon.as_ref(), ids.as_mut()) {
                     let (m, new_ids) = build_menu(engine.is_running(), current_status,

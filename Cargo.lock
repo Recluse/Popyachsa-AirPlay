@@ -2304,7 +2304,7 @@ dependencies = [
 
 [[package]]
 name = "popyachsa-airplay"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "airplay-lib",
  "anyhow",

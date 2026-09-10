@@ -475,10 +475,36 @@ Not done here: measuring the actual cost. A mirror session at 4K/h265 on the
 Linux AppImage, `-O0` vs `-O2` for `renderers/`, is the number that would settle
 whether option 1/2 is urgent or merely correct.
 
-## TEXT off in the HLS branch is a macOS fix that costs Windows its subtitles
+## ~~TEXT off in the HLS branch is a macOS fix that costs Windows its subtitles~~ — and two more: f700f24 broke HLS on Windows and Linux
 
-**Status:** identified 2026-09-10 by the Windows 2×2 run, not changed. Ships in
-0.2.14 as is.
+**Status:** **FIXED in fork `5871113`** (2026-09-11): the three non-sink
+changes of `f700f24` are `#ifdef __APPLE__`; Windows and Linux run the
+pre-`f700f24` code verbatim. **Linux 0.2.14 shipped the broken version** and
+needs a re-release; Windows 0.2.14 was never published (held back by exactly
+this). macOS is unaffected by the change.
+
+What the Windows re-test with a real iPhone showed on a core from tip
+`0783c70` *without* any window bind (so nothing but `f700f24` in play):
+
+* **"Begin streaming HLS" marker** — the hosts show their window on it. On
+  macOS the picture is in that window (the HLS sink is bound to the host view
+  under `__APPLE__`). On Windows and Linux playbin renders into the sink's own
+  window, so the host raised an empty fullscreen window over the picture:
+  "black host window", or "small picture in a corner" when the sink's window
+  showed through. `engine_linux.rs` does the same on the marker.
+* **default BUFFERING** — sessions with no marker at all: playbin never
+  reached PLAYING, stuck below 100% on a throttled CDN. The pre-`f700f24`
+  zero-buffer settings had just played 4/4. The `CORRECTED` comment that
+  justified default buffering rested on one observation, on macOS.
+* **TEXT off** — as below.
+
+Pre-`f700f24` cores played 4/4 in the 2×2 run *because* none of the three was
+there. The fix is the smallest one that restores that: each platform keeps
+what it was seen playing with. Whether macOS actually needs default buffering
+(vs. the sink being what differs) is still an open question — the macOS
+bundle has not had a live HLS test since `f700f24`.
+
+Original entry, for the record:
 
 Fork `f700f24` clears `GST_PLAY_FLAG_TEXT` on the HLS playbin unconditionally,
 because on macOS a selected WebVTT rendition hangs preroll (no timed-text

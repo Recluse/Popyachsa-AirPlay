@@ -1,19 +1,21 @@
 # Maintainer: Recluse <me@recluse.ru>
 #
-# DRAFT — binary AUR package over the published Linux release tarball.
-# Before publishing: (1) publish the tarball at the source= URL with the layout in
-# ../README.md, (2) replace sha256sums 'SKIP' with the real hash, (3) regenerate
-# .SRCINFO:  makepkg --printsrcinfo > .SRCINFO
+# Binary AUR package over the published Linux release tarball (layout in
+# ../README.md). On each release: bump pkgver/pkgrel + sha256sums, then
+# regenerate .SRCINFO:  makepkg --printsrcinfo > .SRCINFO
 pkgname=popyachsa-airplay-bin
 _appid=com.popyachsa.AirPlay
-pkgver=0.2.14
+pkgver=0.2.15
 pkgrel=1
 pkgdesc="AirPlay receiver — mirror iPhone, iPad or Mac to your screen (Wi-Fi, low-latency)"
 arch=('x86_64')
 url="https://airplay.popyachsa.com"
 license=('GPL-3.0-or-later')
+# glib-networking: GIO's TLS backend, loaded by name; without it HTTPS HLS
+# segments fail and AirPlay video dies with "Couldn't download fragments".
 depends=('avahi' 'gtk3' 'gst-libav' 'gst-plugins-base' 'gst-plugins-good'
-         'gst-plugins-bad' 'libplist' 'openssl' 'libayatana-appindicator' 'xdotool')
+         'gst-plugins-bad' 'glib-networking' 'libplist' 'openssl'
+         'libayatana-appindicator' 'xdotool')
 optdepends=('gstreamer-vaapi: Intel/AMD hardware H.264/H.265 decode'
             'intel-media-driver: Intel HW decode (Gen8+)'
             'libva-mesa-driver: AMD / older-Intel HW decode')
@@ -21,7 +23,7 @@ provides=('popyachsa-airplay')
 conflicts=('popyachsa-airplay')
 options=('!strip')   # binary + .so are already stripped at release
 source=("popyachsa-airplay-${pkgver}-x86_64.tar.gz::https://dl.airplay.popyachsa.com/popyachsa-airplay-${pkgver}-x86_64.tar.gz")
-sha256sums=('2318150b6119be56d2757c19ea1f192a0ac5718f3ff32b5aa9e3273c68d426d2')
+sha256sums=('d31a3ab33198c11272050c967a9fd247e4540ce77f9a8400b7a96ccade7b4b37')
 
 package() {
     cd "$srcdir"

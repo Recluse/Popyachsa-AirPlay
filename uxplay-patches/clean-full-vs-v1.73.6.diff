@@ -1068,7 +1068,7 @@ index 0000000..c393a67
 +    }
 +}
 diff --git a/renderers/video_renderer.c b/renderers/video_renderer.c
-index ea1c450..e2d5bb9 100644
+index ea1c450..288dd53 100644
 --- a/renderers/video_renderer.c
 +++ b/renderers/video_renderer.c
 @@ -20,10 +20,59 @@
@@ -1245,7 +1245,7 @@ index ea1c450..e2d5bb9 100644
  }
  
  GstElement *make_video_sink(const char *videosink, const char *videosink_options) {
-@@ -300,20 +411,96 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
+@@ -300,20 +411,99 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
              g_assert(renderer_type[i]->pipeline);
              renderer_type[i]->codec = hls;
              /* if we are not using an autovideosink, build a videosink based on the string "videosink" */
@@ -1310,43 +1310,46 @@ index ea1c450..e2d5bb9 100644
              g_object_get(renderer_type[i]->pipeline, "flags", &flags, NULL);
 -            flags |= GST_PLAY_FLAG_DOWNLOAD;
 -            flags |= GST_PLAY_FLAG_BUFFERING;    // set by default in playbin3, but not in playbin2; is it needed?
-+            /* PATCH (media-mode lag-reduction), CORRECTED.  It used to also clear
-+             * BUFFERING and set buffer-duration/size to 0, on the stated grounds
-+             * that "source is iPhone in LAN" -- which is true of MIRRORING and
-+             * false of exactly the path this branch is.  In the AirPlay video
-+             * protocol the phone hands over a URL and GStreamer fetches the
-+             * segments from the sender's CDN over the internet; there is no
-+             * preroll reserve to give away.  Measured on Windows with a real
-+             * iPhone: with buffering off the picture froze on its first frame
-+             * while the phone's clock ran on; with buffering restored it played,
-+             * and the owner's remaining complaint was a slow START -- the cost of
-+             * having no reserve.  DOWNLOAD stays off (an on-disk cache buys a
-+             * receiver nothing), buffering goes back to the default. */
-+            flags &= ~GST_PLAY_FLAG_DOWNLOAD;
-+            /* PATCH (macOS bundle): TEXT off.  A receiver has no subtitle UI, but
-+             * playbin still opens a text branch for any WebVTT rendition a master
-+             * playlist advertises -- and with no webvttdec/timed-text decoder it
-+             * sits at "buffering 0%" FOREVER, logging only a "Missing element"
-+             * WARNING.  That is a silent hang indistinguishable from the missing
-+             * plugins this same release fixes.  Measured: identical stream +
-+             * identical bundle, TEXT set -> never prerolls; TEXT clear -> plays.
-+             * Clearing it also keeps subparse/pango (+13 MB of font stack) out of
-+             * the bundle.
-+             * Measured on macOS only.  On Windows (2026-09-10, four runs with a
-+             * real iPhone) the bundle HAS subparse: YouTube's caption rendition
-+             * (DEFAULT=NO,AUTOSELECT=YES) is auto-selected by decodebin3 whether
-+             * or not CC is on at the phone, and it renders -- so there this line
-+             * removes working subtitles.  Kept unconditional until the Linux
-+             * bundle is checked for subparse; see BACKLOG "TEXT off". */
++            flags &= ~GST_PLAY_FLAG_DOWNLOAD;   /* an on-disk cache buys a receiver nothing */
++#ifdef __APPLE__
++            /* PATCH (macOS): default BUFFERING and TEXT off.  Both were measured on
++             * the macOS bundle only and, until 0783c70, applied to every platform;
++             * on Windows that turned a 4/4 playing configuration into black windows
++             * and freezes (2026-09-11, real iPhone), so they are Apple-only now.
++             *   BUFFERING: with the pre-f700f24 zero-buffer settings the macOS
++             *   picture froze on its first frame while the phone's clock ran on;
++             *   the default preroll reserve played.  On Windows the opposite was
++             *   measured: default buffering sat below 100% and never reached
++             *   PLAYING, zero-buffer played.  Whether the difference is the sink
++             *   (AVSampleBufferDisplayLayer vs d3d11) or the CDN of the day is not
++             *   settled; each platform keeps what it was seen playing with.
++             *   TEXT: the macOS bundle has no timed-text decoder, so a selected
++             *   WebVTT rendition sits at "buffering 0%" forever with only a
++             *   "Missing element" WARNING.  Windows and Linux ship subparse and
++             *   render the captions; there TEXT stays on. */
 +            flags &= ~GST_PLAY_FLAG_TEXT;
              g_object_set(renderer_type[i]->pipeline, "flags", flags, NULL);
 +            logger_log(logger, LOGGER_INFO,
 +                       "playbin%u configured for HLS: flags=0x%x (buffering left at the default)",
 +                       playbin_version, flags);
++#else
++            /* PATCH (media-mode lag-reduction): no preroll reserve -- the settings
++             * the Windows 2x2 re-test played 4/4 with (2026-09-10); see above for
++             * why this is not applied on macOS. */
++            flags &= ~GST_PLAY_FLAG_BUFFERING;
++            g_object_set(renderer_type[i]->pipeline, "flags", flags, NULL);
++            g_object_set(renderer_type[i]->pipeline,
++                         "buffer-duration", (gint64) 0,
++                         "buffer-size",     (gint)  0,
++                         NULL);
++            logger_log(logger, LOGGER_INFO,
++                       "playbin%u configured for low-latency HLS: flags=0x%x buffer-duration=0 buffer-size=0",
++                       playbin_version, flags);
++#endif
              //g_object_set (G_OBJECT (renderer_type[i]->pipeline), "uri", uri, NULL);
          } else {
              bool jpeg_pipeline = false;
-@@ -334,6 +521,9 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
+@@ -334,6 +524,9 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
              if (jpeg_pipeline) {
                  g_string_append(launch, "jpegdec ");
              } else {
@@ -1356,7 +1359,7 @@ index ea1c450..e2d5bb9 100644
                  g_string_append(launch, "queue ! ");
                  g_string_append(launch, parser);
                  g_string_append(launch, " ! ");
-@@ -347,12 +537,37 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
+@@ -347,12 +540,37 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
              if (!rtp || jpeg_pipeline) {
                  g_string_append(launch, " ! ");
                  append_videoflip(launch, &videoflip[0], &videoflip[1]);
@@ -1395,7 +1398,7 @@ index ea1c450..e2d5bb9 100644
                  g_string_append(launch, videosink);
                  g_string_append(launch, " name=");
                  g_string_append(launch, videosink);
-@@ -361,11 +576,14 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
+@@ -361,11 +579,14 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
                  g_string_append(launch, videosink_options);
                  if (video_sync && !jpeg_pipeline) {
                      g_string_append(launch, " sync=true");
@@ -1405,14 +1408,14 @@ index ea1c450..e2d5bb9 100644
                      g_string_append(launch, " sync=false");
 -                    sync = false;
 +                    vsync_prop = false;
-+                }
-+#ifdef __APPLE__
                  }
++#ifdef __APPLE__
++                }
 +#endif
              }
              if (!strcmp(renderer_type[i]->codec, h264)) {
                  char *pos = launch->str;
-@@ -399,7 +617,188 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
+@@ -399,7 +620,188 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
              gst_pipeline_use_clock(GST_PIPELINE_CAST(renderer_type[i]->pipeline), clock);
              renderer_type[i]->appsrc = gst_bin_get_by_name (GST_BIN (renderer_type[i]->pipeline), "video_source");
              g_assert(renderer_type[i]->appsrc);
@@ -1601,7 +1604,7 @@ index ea1c450..e2d5bb9 100644
              g_string_free(launch, TRUE);
              gst_caps_unref(caps);
              gst_object_unref(clock);
-@@ -452,7 +851,11 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
+@@ -452,7 +854,11 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
                         "\nor your choices of video options (-vs -vd -vc -fs etc.) are incompatible on"
                         "\nthis computer architecture.  (An example: kmssink with fullscreen option -fs"
                         "\nmay work on some systems, but fail on others)");
@@ -1614,7 +1617,7 @@ index ea1c450..e2d5bb9 100644
          }
      }
  }
-@@ -483,7 +886,19 @@ void video_renderer_resume() {
+@@ -483,7 +889,19 @@ void video_renderer_resume() {
  void video_renderer_start() {
      GstState state;
      const gchar *state_name = NULL;
@@ -1634,7 +1637,7 @@ index ea1c450..e2d5bb9 100644
          g_object_set (G_OBJECT (renderer->pipeline), "uri", renderer->uri, NULL);
          gst_element_set_state (renderer->pipeline, GST_STATE_PAUSED);
  	gst_element_get_state(renderer->pipeline, &state, NULL, 1000 * GST_MSECOND);
-@@ -493,6 +908,7 @@ void video_renderer_start() {
+@@ -493,6 +911,7 @@ void video_renderer_start() {
      } 
      /* when not hls, start both h264 and h265 pipelines; will shut down the "wrong" one when we know the codec */
      for (int i = 0; i < n_renderers; i++) {
@@ -1642,7 +1645,7 @@ index ea1c450..e2d5bb9 100644
          gst_element_set_state (renderer_type[i]->pipeline, GST_STATE_PAUSED);
          gst_element_get_state(renderer_type[i]->pipeline, &state, NULL, 1000 * GST_MSECOND);
          state_name = gst_element_state_get_name(state);
-@@ -508,7 +924,10 @@ void video_renderer_start() {
+@@ -508,7 +927,10 @@ void video_renderer_start() {
  /* used to find any X11 Window used by the playbin (HLS) pipeline after it starts playing. 
  *  if use_x11 is true, called every 100 ms after playbin state is READY until the x11 window is found*/
  bool waiting_for_x11_window() {
@@ -1654,7 +1657,7 @@ index ea1c450..e2d5bb9 100644
          return false;
      }
  #ifdef X_DISPLAY_FIX
-@@ -584,7 +1003,7 @@ uint64_t video_renderer_render_buffer(unsigned char* data, int *data_len, int *n
+@@ -584,7 +1006,7 @@ uint64_t video_renderer_render_buffer(unsigned char* data, int *data_len, int *n
      GstBuffer *buffer = NULL;
      GstClockTime pts = (GstClockTime) *ntp_time; /*now in nsecs */
      //GstClockTimeDiff latency = GST_CLOCK_DIFF(gst_element_get_current_clock_time (renderer->appsrc), pts);
@@ -1663,7 +1666,7 @@ index ea1c450..e2d5bb9 100644
          if (pts >= gst_video_pipeline_base_time) {
              pts -= gst_video_pipeline_base_time;
          } else {
-@@ -613,7 +1032,7 @@ uint64_t video_renderer_render_buffer(unsigned char* data, int *data_len, int *n
+@@ -613,7 +1035,7 @@ uint64_t video_renderer_render_buffer(unsigned char* data, int *data_len, int *n
          buffer = gst_buffer_new_allocate(NULL, *data_len, NULL);
          g_assert(buffer != NULL);
          //g_print("video latency %8.6f\n", (double) latency / SECOND_IN_NSECS);
@@ -1672,7 +1675,7 @@ index ea1c450..e2d5bb9 100644
              GST_BUFFER_PTS(buffer) = pts;
          }
          gst_buffer_fill(buffer, 0, data, *data_len);
-@@ -714,9 +1133,24 @@ static void video_renderer_destroy_instance(video_renderer_t *renderer) {
+@@ -714,9 +1136,24 @@ static void video_renderer_destroy_instance(video_renderer_t *renderer) {
          if (renderer->textsrc) {
              gst_object_unref (renderer->textsrc);
              renderer->textsrc = NULL;
@@ -1698,7 +1701,7 @@ index ea1c450..e2d5bb9 100644
  #ifdef X_DISPLAY_FIX
          if (renderer->gst_window){
  	  // free_X11_Display(renderer->gst_window);   without this, a memory leak; with it, a coredump
-@@ -737,6 +1171,7 @@ void video_renderer_destroy() {
+@@ -737,6 +1174,7 @@ void video_renderer_destroy() {
      for (int i = 0; i < n_renderers; i++) {
          if (renderer_type[i]) {
              video_renderer_destroy_instance(renderer_type[i]);
@@ -1706,12 +1709,13 @@ index ea1c450..e2d5bb9 100644
          }
      }
  }
-@@ -930,7 +1365,17 @@ static gboolean gstreamer_video_pipeline_bus_callback(GstBus *bus, GstMessage *m
+@@ -930,7 +1368,24 @@ static gboolean gstreamer_video_pipeline_bus_callback(GstBus *bus, GstMessage *m
              if (new_state != GST_STATE_PLAYING) {
                  hls_playing = FALSE;
                  break;
 -            } 
 +            }
++#ifdef __APPLE__
 +            if (!hls_playing) {
 +                /* PATCH (Plan B / macOS host): the host shows + fits its mirror
 +                 * window on the "Begin streaming" marker, which video_renderer_render_buffer()
@@ -1719,13 +1723,19 @@ index ea1c450..e2d5bb9 100644
 +                 * protocol never touches, so the picture landed in a window that
 +                 * was still hidden.  playbin reaching PLAYING is the HLS equivalent
 +                 * of that first packet.  (No wxh line: playbin knows the size, the
-+                 * layer letterboxes into whatever window size the host chose.) */
++                 * layer letterboxes into whatever window size the host chose.)
++                 * Apple-only: the HLS sink is bound into the host view only under
++                 * __APPLE__ (video_renderer_init).  Elsewhere playbin renders into
++                 * the sink's own window, and this marker made the Windows and Linux
++                 * hosts raise an EMPTY fullscreen window over it (0.2.14 Linux,
++                 * Windows re-test 2026-09-11). */
 +                logger_log(logger, LOGGER_INFO, "Begin streaming HLS video to GStreamer playbin");
 +            }
++#endif
              hls_playing = TRUE;
              GstQuery *query = NULL;
              query = gst_query_new_seeking(GST_FORMAT_TIME);
-@@ -1041,7 +1486,12 @@ int video_renderer_choose_codec (bool video_is_jpeg, bool video_is_h265) {
+@@ -1041,7 +1496,12 @@ int video_renderer_choose_codec (bool video_is_jpeg, bool video_is_h265) {
      gst_element_set_state (renderer->pipeline, GST_STATE_PLAYING);
      GstState old_state, new_state;
      if (gst_element_get_state(renderer->pipeline, &old_state, &new_state, 100 * GST_MSECOND) == GST_STATE_CHANGE_FAILURE) {
@@ -1739,7 +1749,7 @@ index ea1c450..e2d5bb9 100644
          return -1;
      }
      logger_log(logger, LOGGER_DEBUG, "video_pipeline state change from %s to %s\n",
-@@ -1061,6 +1511,11 @@ int video_renderer_choose_codec (bool video_is_jpeg, bool video_is_h265) {
+@@ -1061,6 +1521,11 @@ int video_renderer_choose_codec (bool video_is_jpeg, bool video_is_h265) {
              video_renderer_destroy_instance(renderer_unused);
          }
      }
@@ -1751,7 +1761,7 @@ index ea1c450..e2d5bb9 100644
      return 0;
  }
      
-@@ -1141,13 +1596,27 @@ void video_renderer_seek(float position) {
+@@ -1141,13 +1606,27 @@ void video_renderer_seek(float position) {
  
  unsigned int video_renderer_listen(void *loop, int id) {
      g_assert(id >= 0 && id < n_renderers);

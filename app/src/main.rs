@@ -469,8 +469,18 @@ fn redirect_stdio_to_log() {
     // The engine (uxplay-core.dll, MinGW/UCRT) logs via the C runtime FILE*
     // stderr/stdout. The app (MSVC) and the DLL share ucrtbase.dll, so
     // `_wfreopen` on the shared stderr re-points it for BOTH — unlike SetStdHandle
-    // or _dup2, which don't update a FILE*'s cached handle. We then point stdout
-    // at stderr's fd, and Rust's own Win32-handle stderr/stdout at the same file.
+    // or _dup2, which don't update a FILE*'s cached handle.
+    //
+    // BOTH streams have to be freopen'd. Doing stderr and then _dup2-ing stdout
+    // onto its fd looks equivalent and is not: this is a windows-subsystem
+    // process, so it starts with no console, stdout's FILE* has no valid fd
+    // (`_fileno` gives -2), and `_dup2(fd, -2)` fails and returns -1 with nothing
+    // to say about it. The cost was total — measured across three separate
+    // engine.log files, including one from a clean shutdown, NOT ONE line of the
+    // engine's own output was ever captured. No UxPlay banner, no GStreamer
+    // messages, none of uxplay.cpp's LOGI/LOGD. The only engine-side lines that
+    // ever appeared came from the dnssd shim, which writes to stderr and flushes.
+    // Everything else went to a stream nobody was reading.
     extern "C" {
         fn _wfreopen(path: *const u16, mode: *const u16, stream: *mut core::ffi::c_void)
             -> *mut core::ffi::c_void;
@@ -478,7 +488,9 @@ fn redirect_stdio_to_log() {
         fn _dup2(fd1: i32, fd2: i32) -> i32;
         fn _fileno(stream: *mut core::ffi::c_void) -> i32;
         fn _get_osfhandle(fd: i32) -> isize;
+        fn setvbuf(stream: *mut core::ffi::c_void, buf: *mut u8, mode: i32, size: usize) -> i32;
     }
+    const _IONBF: i32 = 4; // ucrt: unbuffered
 
     let dir = engine::engine_log_dir();
     let _ = std::fs::create_dir_all(&dir);
@@ -494,8 +506,19 @@ fn redirect_stdio_to_log() {
         if _wfreopen(path.as_ptr(), mode.as_ptr(), se).is_null() {
             return;
         }
-        // stdout (FILE*) shares stderr's fd → same file, single offset.
-        _dup2(_fileno(se), _fileno(__acrt_iob_func(1)));
+        // stdout: freopen FIRST, so it has a real fd at all ("a", because stderr's
+        // "w" already truncated the file), and only then point that fd at stderr's
+        // so the two share one file offset and cannot overwrite each other.
+        let so = __acrt_iob_func(1); // stdout FILE*
+        let append: [u16; 2] = [b'a' as u16, 0];
+        if !_wfreopen(path.as_ptr(), append.as_ptr(), so).is_null() {
+            _dup2(_fileno(se), _fileno(so));
+            // The engine's printf output is fully buffered against a file and
+            // uxplay.cpp's log() never flushes, so buffered lines arrive late or,
+            // if the process is killed, not at all — and a log you read after a
+            // hang is exactly the one that must not be missing its last lines.
+            setvbuf(so, std::ptr::null_mut(), _IONBF, 0);
+        }
         // Rust's eprintln!/println! go through the Win32 std handles; point them
         // at the same handle freopen just opened.
         let oh = _get_osfhandle(_fileno(se));
@@ -528,6 +551,21 @@ fn redirect_stdio_to_log() {
         // dup2 both onto the file's open description -> shared offset, no clobber.
         libc::dup2(fd, libc::STDOUT_FILENO);
         libc::dup2(fd, libc::STDERR_FILENO);
+        // Unbuffered, for the same reason as the Windows path: stdout is a file
+        // now, so libc makes it FULLY buffered, and uxplay.cpp's log() never
+        // flushes. A log read while the app is hung — the only time anyone reads
+        // it — would be missing up to 4 KB of exactly the lines that matter, and
+        // a killed process loses them for good. stderr is unbuffered already.
+        // Has to be the process's own `stdout` FILE*, not a fresh fdopen of fd 1:
+        // the engine's printf writes to that one. Linked by name because the
+        // libc crate does not expose it — glibc calls the symbol `stdout`, Apple
+        // calls it `__stdoutp`.
+        extern "C" {
+            #[cfg_attr(target_os = "macos", link_name = "__stdoutp")]
+            #[cfg_attr(not(target_os = "macos"), link_name = "stdout")]
+            static stdout_stream: *mut libc::FILE;
+        }
+        libc::setvbuf(stdout_stream, std::ptr::null_mut(), libc::_IONBF, 0);
     }
     // The dup'd fds reference the file; keep it open for the process lifetime.
     std::mem::forget(file);

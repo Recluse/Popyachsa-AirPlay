@@ -30,7 +30,9 @@ ordering rules in the release runbook can be retired. The rules stay until then.
 
 ## Network adapter selection
 
-**Status:** implemented, **not merged** — three live gates below are unrun.
+**Status:** **SHIPPED in 0.2.13** (2026-09-10), issue #1 closed. Three of the four
+gates below passed; gate 2 is still unrun and is the one open question about this
+feature. Kept here for that gate and for the indirect link noted under gate 4.
 **Reported:** GitHub mirror issue [#1 "allow LAN Card selecting"](https://github.com/Recluse/Popyachsa-AirPlay/issues/1),
 2026-08-06. (Issues land on the GitHub mirror, not the GitLab canonical repo — check
 `gh issue list -R Recluse/Popyachsa-AirPlay` periodically.)
@@ -144,9 +146,18 @@ loopback path harder than an address bind does).
 Diagnostic: `popyachsa-airplay --list-interfaces` prints exactly what the dropdown sees.
 Default stays "Automatic", byte-identical to the pre-feature build.
 
-## The engine log loses exactly the lines you need after a hang
+## ~~The engine log loses exactly the lines you need after a hang~~
 
-**Status:** confirmed while diagnosing something else, not fixed.
+**Status:** **FIXED in 0.2.13** — and it was worse than this entry described. The
+log did not lose the tail; it never contained one line of engine output at all,
+on any platform. Windows because `redirect_stdio_to_log` `_dup2`'d stdout onto a
+FILE* with no valid fd (a windows-subsystem process has no console, `_fileno`
+gives -2, and the call fails silently); macOS and Linux because stdout is a file
+there and libc makes it fully buffered while `uxplay.cpp`'s `log()` never
+flushes. Both freopen'd and unbuffered now (`39854ec`, `5ee3240`, `0931108`);
+measured on macOS as 0 engine lines before and 6 after, and on Windows as a full
+79-line log surviving a force-kill. The analysis below is kept because it is how
+the Windows half was found.
 **Found:** 2026-09-09, investigating a receiver hang on macOS.
 
 `redirect_stdio_to_log()` points the engine's stdout at a file, and stdio is
@@ -165,10 +176,41 @@ redirect, or `_IONBF` if the throughput cost is acceptable — the engine's norm
 output is modest, and `-FPSdata` telemetry is the only high-rate producer. Measure
 before choosing: this runs on the streaming path.
 
-## The AirPlay *video* protocol cannot work in the macOS bundle — no HLS plugins
+## ~~The AirPlay *video* protocol cannot work in the macOS bundle — no HLS plugins~~
 
-**Status:** diagnosed, not fixed. Pre-existing; **the shipped 0.2.12 has it too**.
+**Status:** **FIXED for 0.2.14** — macOS by `fb9fe4b` (HLS plugins + GIO TLS
+module bundled, TEXT off in the fork), Windows by `29ae912` (GIO TLS module
+bundled). Pre-existing; **the shipped 0.2.12/0.2.13 have it**.
 **Found:** 2026-09-09, when sending a video appeared to hang the receiver.
+
+**What actually fixed it, per platform — corrected 2026-09-10.** Commit
+`a2cd0e4` and fork commit `ebffb05` claimed the playlist-expander heap fix
+"alone" made video play. That was wrong. The Windows session re-tested with one
+variable at a time, a real iPhone, and cores that differ in exactly that hunk
+(sha256 `dfce7e0c…62ce3` fixed, `eaca04fc…12ec8` buggy):
+
+| run | core | clip | IDSE | PLAYING | subparse | result |
+|---|---|---|---|---|---|---|
+| 1 | buggy | plain | 0 | yes | yes | plays |
+| 2 | buggy | CC on | 0 | yes | yes | plays, subtitles shown |
+| 3 | fixed | plain | 0 | yes | yes | plays |
+| 4 | fixed | CC on | 0 | yes | yes | plays, subtitles shown |
+| 5 | buggy | plain, `lib/gio/modules/` removed | 0 | no | no | `Couldn't download fragments` |
+
+(IDSE = "Internal data stream error".) Every run: `PREFIX="s/"`. So:
+
+* **The heap fix is a no-op on real traffic.** `prefix_len` is 2, where the old
+  size is exact. Correct for other prefixes; not why anything plays.
+* **Windows: the fix was the GIO TLS backend.** Run 5 is the single-variable
+  proof; the early symptom was `hlsdemux2 Couldn't download fragments`.
+* **The "Internal data stream error" seen during the first debugging round did
+  not reproduce** in any clean run, with or without TLS. Cause unknown; it was
+  attributed to the heap bug without evidence.
+* **The WebVTT hang is macOS-only.** The Windows bundle has `subparse`; the
+  YouTube caption rendition (`DEFAULT=NO,AUTOSELECT=YES`) is auto-selected by
+  decodebin3 in all four runs, CC on or off at the phone, and renders. macOS has
+  no timed-text decoder in the bundle, so there TEXT on hangs. See "TEXT off"
+  below for the consequence.
 
 **Scope, precisely — this is narrower than "video is broken".** AirPlay carries
 video two different ways, and only one of them is affected:
@@ -280,18 +322,24 @@ or `playback`. Pre-existing upstream, and not reachable in our macOS bundle
 never kill the host" invariant incomplete. Fixing means propagating a NULL slot
 through the rest of `audio_renderer_init` and its consumers.
 
-**4. `status.rs:75` can stop a healthy engine on client-controlled text.**
-The marker is `contains("failed with error code")`, and `lib/raop.c` logs client
-plists through the same hook. The correct anchor is
-`starts_with("dnssd_register")` **combined** with the phrase — the two real lines are
-`dnssd_register_raop failed with error code %d` and `dnssd_register_airplay …`, so a
-naive `starts_with("failed with error code")` silently breaks the P1 match instead.
+**4. ~~`status.rs` could stop a healthy engine on client-controlled text.~~**
+**FIXED 2026-09-10** (`700b943`). All four `contains` markers are anchored at line
+start, and the dnssd one additionally requires the `dnssd_register` prefix both
+real lines carry — a bare `starts_with("failed with error code")` would have
+looked like a fix while breaking the match it was meant to preserve. Anchoring is
+safe because `process_metadata` only appends a value in the branch that just
+appended its DMAP label, and the whole blob is logged as one multi-line message,
+so only the first field's label can lead it. Six regression cases, each checked
+to be flagged fatal by the previous logic.
 
-**5. Shim: `DNSServiceRefDeallocate()` frees after a timeout.**
-`dnssd_shim.c` waits 3000 ms for the responder thread, then `CloseHandle` + `free`
-unconditionally. If the thread has not exited, that is a use-after-free plus a leaked
-socket. Pre-existing, unrelated to the adapter-selection work, lives in
-[[airplay-where-things-live]]'s shim repo.
+**5. ~~Shim: `DNSServiceRefDeallocate()` freed after a timeout.~~**
+**FIXED in shim 1.1.1** (`47bd0af`). Ownership is handed off through an
+interlocked `released` field rather than guessed: the responder thread and the
+deallocator both exchange a 1 into it, and whichever reads back a 1 arrived
+second and frees. Exactly one ever frees, and a genuinely stuck thread costs one
+leaked struct instead of a use-after-free.
+**NOT YET SHIPPED** — 0.2.13 carries 1.1.0. The next Windows release must rebuild
+the shim, and its log line should read 1.1.1.
 
 ## macOS update: the extractor refuses to write *through* a symlink
 
@@ -328,3 +376,170 @@ hand-written in the landing repo's `index.html` (`ci/update_landing.py` only tou
 `CHANGELOG.html` and the schema.org `softwareVersion`), and the AppImage's `.zsync`
 carries the filename in its own header. Shipping the rename without both points every
 client at a 404.
+
+## A failed GStreamer init tells the host *that* it failed, never *why*
+
+**Status:** identified 2026-09-10 while verifying the shipped 0.2.13 engine, not
+fixed — the fix is a signature change, and the reachable half is already covered.
+
+`gstreamer_init()` now uses `gst_init_check()` and returns false instead of
+letting `gst_init()` terminate the process (that was the audit fix). But it
+reports the reason with `g_print`, not through the logger, and it has no choice:
+`renderers/audio_renderer.c`'s static `logger` is assigned in
+`audio_renderer_init()`, which has not run yet. Upstream's `check_plugins()`
+prints its "Required gstreamer plugin not found" messages the same way for the
+same reason.
+
+`g_print` writes to stdout. The host's log-forward hook is not stdout, so the
+reason never reaches `status.rs`, and on macOS — where the tray is launched from
+Finder and its stdout goes nowhere — it is lost entirely.
+
+What the host *does* get is the caller's `LOGE("stopping: …")` at
+`uxplay.cpp:3600`, which travels the hook and matches the fatal-start marker. So
+the user is told the engine failed to start; they are not told that GStreamer is
+missing a plugin. Given macOS bundles GStreamer, this is only reachable on a
+broken Linux or Windows install.
+
+The fix is to give `gstreamer_init()` a way to hand the message back — an
+out-parameter or a returned string — and have `uxplay.cpp` LOGE it. One caller,
+but it changes `audio_renderer.h`, and doing it properly means the same
+treatment for `check_plugins()`'s five messages, which are the more useful ones.
+
+Same defect class as [[airplay-where-things-live]]'s shim story: the code was
+correct and the channel was wrong.
+
+## Three platforms, three different compiler policies — Linux shipped its renderers at -O0
+
+**Status:** measured 2026-09-10, not changed. A decision, not a one-liner: fixing
+the optimisation also decides what happens to `assert()`.
+**Found:** while checking whether an `assert` in the fork could ever fire.
+
+The engine is configured three different ways and nobody had compared them:
+
+| platform | `CMAKE_BUILD_TYPE` | `uxplay.cpp` (C++) | `lib/*.c` | `renderers/*.c` | `assert()` |
+|---|---|---|---|---|---|
+| macOS (`build-core-*.sh`) | `Release` | `-O3 -DNDEBUG` | `-O3 -DNDEBUG` | `-O3 -DNDEBUG` | compiled out |
+| Linux (`Dockerfile.u24` recipe, 0.2.13 as shipped) | *(empty)* | **none** | `-O2` | **none** | live |
+| Windows (`uxplay-patches/README.md` recipe) | *(empty)* | **none** | `-O2` | **none** | live |
+
+Read straight out of the Linux container's `build.ninja` for the 0.2.13 build:
+`uxplay.cpp.o` gets `FLAGS = -std=gnu++11 -fPIC`, `video_renderer.c.o` gets
+`FLAGS = -fPIC`, `raop.c.o` gets `-Wall -O2`. The only `-O2` in the whole file
+comes from `lib/CMakeLists.txt`, which sets `CMAKE_C_FLAGS` in *its own directory
+scope*: `lib/` gets it, `renderers/` (a sibling) and `uxplay.cpp` (C++, a
+different flags variable entirely) do not. With no build type, CMake adds
+nothing of its own.
+
+Windows, checked by the Windows session in its 0.2.14 tree (`UxPlay-0214/
+build.ninja`, same CMakeLists, same empty build type): identical shape.
+`uxplay.cpp` → `-std=gnu++11`, no `-O`; `renderers/video_renderer.c` has no
+`FLAGS` line at all; every `lib/*.c` carries `-O2`. It also names one more file
+this table had missed, and it applies to Linux too: `lib/airplay_core.cpp`, the
+DLL/.so entry point, is C++ and gets no `-O` either — `lib/CMakeLists.txt`'s
+`-O2` goes into `CMAKE_C_FLAGS`, and a `.cpp` reads `CMAKE_CXX_FLAGS`. The exact
+tree that built the shipped 0.2.13 DLL could not be found, but the flags are a
+function of CMakeLists + build type and nothing else, and both were the same.
+
+So the Linux and Windows 0.2.13 engines shipped with the protocol library
+optimised and everything else — `uxplay.cpp`, `airplay_core.cpp`, and the whole
+`renderers/` directory, which is the per-frame GStreamer glue on the mirror path
+(`video_renderer_render_buffer()` pushes every mirror frame into appsrc) — at
+`-O0`. The audio/video decode itself lives in GStreamer, so this is not a
+"video is slow" defect; it is a "we never looked" defect with an unmeasured cost
+on the packet path.
+
+The second column matters as much as the first. Windows and Linux ship with
+`assert()` live; macOS ships with it compiled out. The Windows session showed
+today what live asserts buy: in `adjust_yt_condensed_playlist` a `PREFIX` of any
+length but 2 would abort with a clear SIGABRT rather than serve heap bytes — and
+the absence of such reports is itself evidence about what senders emit. On
+macOS the same input would have gone out silently.
+
+**Options for 0.2.14, in order of how much they change:**
+
+1. **`-DCMAKE_BUILD_TYPE=Release` on Linux and Windows**, matching macOS. One
+   flag in two recipes. Gets `-O3` everywhere — and compiles asserts out on the
+   two platforms that currently have them, which changes *how* things fail there.
+2. **`Release`, but keep asserts**: additionally pass
+   `-DCMAKE_C_FLAGS_RELEASE=-O2 -DCMAKE_CXX_FLAGS_RELEASE=-O2` so CMake's
+   default `-O3 -DNDEBUG` is replaced. Optimised and asserting on all three,
+   including macOS if the scripts are changed too. Most consistent; also the
+   most novel, so it needs a real run on each platform before it ships.
+3. **Leave it.** Record the fact and ship 0.2.14 as 0.2.13 was built. Nothing
+   gets worse; nothing gets measured either.
+
+Whichever is picked, `-DNO_MARCH_NATIVE=ON` stays: `Release` does not imply it,
+and the `-march=native` incident is the one this file already documents.
+
+Not done here: measuring the actual cost. A mirror session at 4K/h265 on the
+Linux AppImage, `-O0` vs `-O2` for `renderers/`, is the number that would settle
+whether option 1/2 is urgent or merely correct.
+
+## TEXT off in the HLS branch is a macOS fix that costs Windows its subtitles
+
+**Status:** identified 2026-09-10 by the Windows 2×2 run, not changed. Ships in
+0.2.14 as is.
+
+Fork `f700f24` clears `GST_PLAY_FLAG_TEXT` on the HLS playbin unconditionally,
+because on macOS a selected WebVTT rendition hangs preroll (no timed-text
+decoder in the bundle). On Windows the bundle has `subparse`, the rendition is
+auto-selected regardless of the phone's CC toggle, and it rendered in all four
+runs on the pre-`f700f24` core. With `f700f24` those subtitles are gone.
+
+Two ways out, in order of preference:
+
+1. **Bundle `subparse` on macOS and re-test with a subtitled clip.** If the hang
+   goes away, TEXT stays on everywhere and the flag change is reverted. Cost:
+   `subparse` is small; the +13 MB figure in the fork comment is pango/font
+   stack, which `subparse` alone does not pull — verify with the dependency walk
+   before believing either number. Needs a live device on macOS.
+2. **Make the clear `#ifdef __APPLE__`.** One line. Checked 2026-09-11 while
+   building 0.2.14: the AppImage bundles `libgstsubparse.so`, and the .deb/.rpm
+   depend on `gstreamer1.0-plugins-base` / `gstreamer1-plugins-base`, which
+   ship it. So Linux would render, not hang, and option 2 is safe on all
+   three platforms as built today.
+
+Either way, a receiver without a subtitle toggle rendering captions the sender
+did not ask for is a product question the owner has not answered.
+
+**Found while checking:** the Linux AppImage had the same defect Windows 0.2.13
+had — HLS plugins bundled, no GIO TLS backend (`libgiognutls.so` is not a
+GStreamer plugin, so `linuxdeploy --plugin gstreamer` never sees it), and the
+.deb/.rpm did not depend on `glib-networking`. Fixed in `build-appimage.sh`
+(module deployed under `usr/lib/gio/modules`, `GIO_EXTRA_MODULES` set by an
+AppRun hook, build fails if absent) and in both package scripts, for 0.2.14.
+Nobody had cast AirPlay video to the Linux build; it would have died with
+"Couldn't download fragments".
+
+## Upstream PRs sent (2026-09-10)
+
+Two of the day's fork fixes were rewritten in upstream form — against
+`FDH2/UxPlay` master `366dd5e`, no library-mode code, `exit(1)` where upstream
+uses it — re-verified on a pristine master build, audited by Codex, and opened
+from the owner's account:
+
+* **#568** — Reject trailing and malformed command-line values instead of
+  crashing on them. `uxplay.cpp`, +39/−7, seven defects in `parse_arguments()`.
+  Branch `Recluse/UxPlay:reject-malformed-cli-values` (local `pr2-on-master`).
+* **#569** — Unref the system clock once, not once per audio format.
+  `renderers/audio_renderer.c`, +11/−1.
+  Branch `Recluse/UxPlay:unref-system-clock-once` (local `pr3-on-master`).
+
+**Withdrawn before sending, and why it matters here:** the
+`adjust_yt_condensed_playlist` buffer fix. Upstream issue #563 (2026-08-26)
+reported the same function; the maintainer replied the sizing defect did not
+exist — correct for `PREFIX="s/"`, the only value senders emit, where the
+discrepancy `prefix_len − 2` is zero — and then rewrote the function
+(`575c562`, 2026-08-28) with the exact formula. Two consequences for us: the fix
+in this fork is correct but a no-op on real YouTube traffic (measured: the real
+playlist from #563 through the old code gives `slack=0`, identical bytes), so
+the fork commit `ebffb05`'s claim that it alone made video play was
+unsupported — and the Windows 2×2 re-test then refuted it (table in the video
+section above); and our fork is 54 commits behind master and needs rebasing to
+pick that rewrite up.
+
+Also not sent: `-march=native` (upstream already prints a loud warning; ours to
+read) and the WebVTT/TEXT hang (needs a trimmed GStreamer; the trimming is ours).
+
+Upstream's merged external PRs (#558, #559, #562) set the expected shape: an
+imperative title; symptom, cause, fix, before/after in the body; no sign-off.

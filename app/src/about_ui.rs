@@ -111,7 +111,7 @@ fn apply_theme(ctx: &egui::Context) {
     visuals.widgets.hovered.bg_fill = BG_FIELD.gamma_multiply(1.2);
     visuals.widgets.active.bg_fill = ACCENT_BLUE.gamma_multiply(0.6);
     visuals.selection.bg_fill = ACCENT_BLUE.gamma_multiply(0.35);
-    visuals.selection.stroke = Stroke::new(1.0, ACCENT_BLUE);
+    visuals.selection.stroke = Stroke::new(1.0_f32, ACCENT_BLUE);
     visuals.hyperlink_color = ACCENT_BLUE;
     visuals.window_rounding = Rounding::same(12.0);
     visuals.menu_rounding = Rounding::same(10.0);

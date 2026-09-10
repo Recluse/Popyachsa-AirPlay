@@ -36,13 +36,48 @@ BUNDLE_ID="com.popyachsa.AirPlay"
 OUT="$REPO/build/macos/dist"
 APP="$OUT/$APP_NAME.app"
 
-# GStreamer plugins to bundle. The first block is the EXACT set captured from a
-# live mirror session (lsof on the running app); the second is a safety margin
-# (audio sink + typefinding/parsing/playback that can load lazily).
+# GStreamer plugins to bundle.
+#
+# ⚠ HOW NOT TO MAINTAIN THIS LIST: the first two blocks were captured by lsof'ing
+# a live SCREEN MIRRORING session. That method looks authoritative and is not — it
+# can only ever see the ONE protocol that happened to be running. AirPlay carries
+# video two ways, and a mirror session never loads a single plugin of the second
+# one, so the whole HLS block below was silently missing from 0.2.12 and 0.2.13:
+# casting a video (YouTube & co) left the receiver looking hung. Add plugins for
+# the protocol you are supporting, from the code path that uses them, and say what
+# breaks without each — do not re-derive the list from a running process.
 PLUGINS=(
+  # SCREEN MIRRORING (raop_rtp_mirror -> h264/h265 -> our avlayer appsink sink)
+  # + the audio path. Verified in the field.
   app applemedia audioconvert audioresample autodetect coreelements
   level libav videoconvertscale videofilter videoparsersbad volume
   osxaudio typefindfunctions audioparsers playback
+
+  # AirPlay VIDEO PROTOCOL (on_video_play -> playbin3 on an m3u8, uxplay -hls).
+  # None of these are reachable from a mirror session; all four are required, and
+  # the failure modes are ugly (silent hang, or an error only g_print'd to
+  # engine.log). Measured against Apple's reference HLS streams, in this bundle:
+  #   adaptivedemux2  hlsdemux2 (rank 257 -- beats the legacy `hls` plugin's
+  #                   hlsdemux at 256, which is why `hls` is NOT here; it also
+  #                   carries dashdemux2/mssdemux2, so `dash` is not either).
+  #                   Without it: "urisourcebin: your GStreamer installation is
+  #                   missing a plug-in", nothing plays.
+  #   soup            souphttpsrc (rank 256; `curl`'s curlhttpsrc is 128 and would
+  #                   never be picked, so `curl` is dead weight). Serves BOTH the
+  #                   engine's own http://localhost/master.m3u8 and the CDN
+  #                   segments. Without it: "No URI handler implemented for http".
+  #                   NB the plugin does not LINK libsoup, it dlopens it by leaf
+  #                   name -- see the hand-seeded files in step 3.
+  #   mpegtsdemux     tsdemux, for HLS whose segments are MPEG-TS. Without it:
+  #                   "decodebin3 ... missing a plug-in".
+  #   isomp4          qtdemux, for HLS whose segments are fMP4/CMAF. Both
+  #                   containers occur in the wild; without it that half of the
+  #                   senders get "Missing element: Quicktime demuxer".
+  # NOT here on purpose: `subparse`/`pango`. A master playlist advertising WebVTT
+  # subtitles used to hang playbin at "buffering 0%" forever; the fix is one line
+  # in the fork (video_renderer.c clears GST_PLAY_FLAG_TEXT -- a receiver has no
+  # subtitle UI), which costs 0 MB instead of pango's ~13 MB font stack.
+  adaptivedemux2 soup mpegtsdemux isomp4
 )
 
 echo "==> Popyachsa AirPlay.app  v$VERSION  ($TARGET)"
@@ -130,11 +165,43 @@ echo "==> bundling ${#PLUGINS[@]} plugins + their dependency closure"
 queue=()
 for p in "${PLUGINS[@]}"; do
   src="$GST_PLUGINS/libgst$p.dylib"
-  if [ -f "$src" ]; then cp -p "$src" "$DEST_PLUGINS/"; queue+=( "$src" )
-  else echo "   WARN: plugin libgst$p.dylib not found"; fi
+  # A plugin named here and absent from the framework is a BUILD FAILURE, not a
+  # warning. This gate is the one that had to catch the HLS omission and did not:
+  # the missing plugins were never named, so nothing warned — but a warning would
+  # not have helped either, since it scrolls past in a hundred lines of output and
+  # the bundle ships anyway. If it is in this list, the app needs it.
+  [ -f "$src" ] || { echo "   FATAL: plugin libgst$p.dylib not in $GST_PLUGINS"; exit 1; }
+  cp -p "$src" "$DEST_PLUGINS/"; queue+=( "$src" )
 done
 # seed with uxplay-core's own @rpath deps too
 queue+=( "$C/MacOS/uxplay-core.dylib" )
+
+# Two runtime-loaded files that NOTHING links, so the @rpath BFS below can never
+# reach them and the PLUGINS loop above cannot carry them either (it only ever
+# copies lib/gstreamer-1.0/libgst<name>.dylib). Both are mandatory for the HLS
+# path; both are seeded into the queue, not just copied, so their own closures
+# (libssl/libcrypto/libpsl/libnghttp2) come along.
+#
+#  libsoup-3.0.0.dylib — `otool -L libgstsoup.dylib` lists NO soup dependency:
+#    the plugin g_module_open()s it by bare leaf name (gstsouploader.c), and dyld
+#    resolves a leaf-name dlopen through the CALLING image's LC_RPATH, i.e. the
+#    plugin's own @loader_path/../lib -> DEST_LIB. libgstadaptivedemux2.dylib
+#    contains the same loader, so this is required even if `soup` is ever dropped.
+#  gio/modules/libgioopenssl.so — glib-networking's GIO TLS backend. NOT a
+#    GStreamer plugin and NOT in lib/gstreamer-1.0/. Without it every https://
+#    HLS segment fetch fails with "TLS support is not available" surfacing as
+#    "Internal data stream error ... reason error (-5)". It must keep the
+#    framework's lib/gio/modules/ layout: its own @loader_path/../../../lib rpath
+#    then lands on DEST_LIB, and glib locates the module dir from libgio's own
+#    image path. No CA bundle is needed — it reads the macOS keychain
+#    (links Security.framework).
+mkdir -p "$DEST_LIB/gio/modules"
+for extra in "libsoup-3.0.0.dylib" "gio/modules/libgioopenssl.so"; do
+  [ -f "$GST_LIB/$extra" ] || { echo "missing $GST_LIB/$extra — HLS video would ship broken"; exit 1; }
+  cp -p "$GST_LIB/$extra" "$DEST_LIB/$extra"
+  chmod +w "$DEST_LIB/$extra"
+  queue+=( "$GST_LIB/$extra" )
+done
 
 # BFS the @rpath dependency closure into DEST_LIB (flat, like the framework).
 while [ ${#queue[@]} -gt 0 ]; do
@@ -242,10 +309,12 @@ find "$APP" -name '._*' -delete
 # must fail the build, not print "done" — that suppression is why every release
 # up to 0.2.12 shipped with Sealed Resources=none. Swap `-` for a Developer ID
 # identity here (see BUILD-MACOS.md); this is the order notarization needs too.
-# `-o -name '*.dylib'`: the set is "every Mach-O", not "every file with +x".
-# cp -p carries the source mode over from GStreamer.framework, so a 0644 dylib
-# there would land here unsigned and be skipped without a word.
-find "$APP" -type f \( -perm +111 -o -name '*.dylib' \) ! -path "$C/MacOS/popyachsa-airplay" \
+# `-o -name '*.dylib' -o -name '*.so'`: the set is "every Mach-O", not "every file
+# with +x". cp -p carries the source mode over from GStreamer.framework, so a 0644
+# dylib there would land here unsigned and be skipped without a word — and the GIO
+# TLS module is a `.so`, which today is 0755 and would be caught by luck, not by
+# this predicate meaning what it says.
+find "$APP" -type f \( -perm +111 -o -name '*.dylib' -o -name '*.so' \) ! -path "$C/MacOS/popyachsa-airplay" \
   -exec codesign --force --sign - {} +
 codesign --force --sign - "$APP"
 codesign --verify --strict "$APP"
@@ -253,4 +322,46 @@ echo "   sealed ok"
 
 echo "==> done: $APP"
 du -sh "$APP" | cut -f1 | sed 's/^/    size: /'
-echo "    verify self-containment:  DYLD_PRINT_LIBRARIES=1 '$APP/Contents/MacOS/popyachsa-airplay' 2>&1 | grep -i /Library/Frameworks  # (should be empty)"
+# Static, and it actually answers the question. The old hint here was
+#   DYLD_PRINT_LIBRARIES=1 ... | grep -i /Library/Frameworks
+# which is wrong twice: `-i /Library/Frameworks` also matches every
+# /System/Library/Frameworks line, so it reports ~219 "leaks" on a perfectly
+# self-contained bundle; and a run that does not start the engine never loads
+# GStreamer at all, so a clean result proved nothing either.
+echo "==> self-containment + universal2"
+leaks=0
+thin=0
+count=0
+# `-name '*.so'` too: the GIO TLS module is a Mach-O with a .so extension, and a
+# gate that silently skips it is worse than no gate.
+while IFS= read -r f; do
+  case "$(file -b "$f")" in
+    Mach-O*|*"universal binary"*)
+      count=$((count + 1))
+      if otool -L "$f" 2>/dev/null | grep -q '^	/Library/Frameworks'; then
+        echo "   LEAK: ${f#$APP/} still links the system GStreamer:"
+        otool -L "$f" | grep '^	/Library/Frameworks' | sed 's/^/     /'
+        leaks=$((leaks + 1))
+      fi
+      # Every shipped Mach-O must carry BOTH slices: one arm64-only file anywhere
+      # in the closure is an app that dies on Intel at dlopen time, with the
+      # failure hidden inside GStreamer's plugin loader.
+      archs="$(lipo -archs "$f" 2>/dev/null || echo unknown)"
+      case " $archs " in
+        *" x86_64 "*) case " $archs " in *" arm64 "*) ;; *) echo "   THIN: ${f#$APP/} is '$archs'"; thin=$((thin + 1));; esac ;;
+        *) echo "   THIN: ${f#$APP/} is '$archs'"; thin=$((thin + 1)) ;;
+      esac ;;
+  esac
+done < <(find "$APP" -type f \( -perm +111 -o -name '*.dylib' -o -name '*.so' \))
+[ "$leaks" -eq 0 ] || { echo "   $leaks file(s) would break on a machine without GStreamer installed"; exit 1; }
+# Only a UNIVERSAL build has to be universal. `fatten()` warns and continues when
+# X86_DYLIB is absent, and the header calls an arm64-only bundle "fine for local
+# dev", so failing here would make every dev build exit 1 for doing exactly what
+# the script says it may do. Same signal step 2b uses to decide it is a release.
+if [ -f "$X86_DYLIB" ]; then
+  [ "$thin" -eq 0 ] || { echo "   $thin file(s) are not universal — this bundle would break on Intel"; exit 1; }
+  echo "   $count Mach-O files: no /Library/Frameworks dependencies, all arm64+x86_64"
+else
+  echo "   $count Mach-O files: no /Library/Frameworks dependencies"
+  echo "   (arm64-only dev build — universal2 gate skipped, $thin thin file(s))"
+fi

@@ -6,7 +6,7 @@
 # .SRCINFO:  makepkg --printsrcinfo > .SRCINFO
 pkgname=popyachsa-airplay-bin
 _appid=com.popyachsa.AirPlay
-pkgver=0.2.7
+pkgver=0.2.14
 pkgrel=1
 pkgdesc="AirPlay receiver — mirror iPhone, iPad or Mac to your screen (Wi-Fi, low-latency)"
 arch=('x86_64')
@@ -21,7 +21,7 @@ provides=('popyachsa-airplay')
 conflicts=('popyachsa-airplay')
 options=('!strip')   # binary + .so are already stripped at release
 source=("popyachsa-airplay-${pkgver}-x86_64.tar.gz::https://dl.airplay.popyachsa.com/popyachsa-airplay-${pkgver}-x86_64.tar.gz")
-sha256sums=('3c745d4105903e05b0010bf9a7185e3fba3e9c1a50b96dffae2ade8cb4e8f365')
+sha256sums=('2318150b6119be56d2757c19ea1f192a0ac5718f3ff32b5aa9e3273c68d426d2')
 
 package() {
     cd "$srcdir"

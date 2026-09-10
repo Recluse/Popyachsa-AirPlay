@@ -160,6 +160,23 @@ fn set_bundled_gst_env() {
     // user-writable location, not inside the bundle.
     let reg = crate::config::data_dir().join("gstreamer-registry.bin");
     std::env::set_var("GST_REGISTRY_1_0", &reg);
+    // glib-networking's TLS backend (lib/gio/modules/libgioopenssl.so) is a GIO
+    // module, not a GStreamer plugin, so none of the GST_* vars above reach it —
+    // and without it every https:// HLS segment of the AirPlay *video* protocol
+    // dies as "Couldn't download fragments" / "TLS support is not available".
+    // glib does find it on its own (it relocates the module dir from libgio's own
+    // image path — measured: the bundled module loads with no GIO_* var set; the
+    // dir compiled into libgio is the cerbero build machine's and exists nowhere).
+    // Set it anyway, for the same reason GST_PLUGIN_SYSTEM_PATH_1_0 is set: a
+    // GIO_MODULE_DIR inherited from the user's shell (a GStreamer dev setup) would
+    // otherwise silently point us at the SYSTEM framework's module, and this app
+    // ships its own runtime precisely so it never depends on one. Guarded on the
+    // directory existing, so a new app paired with a pre-0.2.14 bundle (updater
+    // ordering) keeps glib's own lookup rather than being sent nowhere.
+    let gio_modules = gst.join("lib/gio/modules");
+    if gio_modules.is_dir() {
+        std::env::set_var("GIO_MODULE_DIR", &gio_modules);
+    }
 }
 
 /// Build the UxPlay option tail for macOS (device name goes via set_device_name).

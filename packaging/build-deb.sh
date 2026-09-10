@@ -54,8 +54,11 @@ fi
 rm -rf "$ROOT/debian" "$ROOT/.shlibs" "$ROOT/.shlibs.err"
 
 # Runtime deps dpkg-shlibdeps can't see: GStreamer plugins are dlopen'd, avahi is a
-# service. The codec set lives in plugins-{base,good,bad} + libav.
-RUNTIME="gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-libav, avahi-daemon"
+# service. The codec set lives in plugins-{base,good,bad} + libav. glib-networking
+# is GIO's TLS backend, loaded by name: without it souphttpsrc cannot fetch HTTPS
+# HLS segments and AirPlay *video* fails with "Couldn't download fragments" (the
+# Windows 0.2.13 defect). Every desktop has it, a minimal box does not.
+RUNTIME="gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-libav, glib-networking, avahi-daemon"
 DEPS="$RUNTIME${SHLIBS:+, $SHLIBS}"
 INSTALLED="$(du -sk "$ROOT/usr" | cut -f1)"
 

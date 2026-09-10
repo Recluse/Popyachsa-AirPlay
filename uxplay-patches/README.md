@@ -58,6 +58,28 @@ this. The macOS and Linux build scripts already pass the flag; Windows was the
 only path still building native, because it is the only one driven by hand from
 this file rather than by a script.
 
+**Re-run `cmake`, don't just `ninja`.** A build directory remembers the flags it
+was configured with. The long-lived `build/` on the Windows machine predates this
+recipe, so `ninja -C build` there still produces a native-march engine — measured
+2026-09-10, ymm=229, i.e. exactly the artifact 0.2.13 was cut to replace. The
+0.2.13 release DLL came from a separately configured tree. Any build you intend to
+ship must go through the `cmake` line above first, in a directory you know carries
+the flag; `grep NO_MARCH_NATIVE build/CMakeCache.txt` answers it in one command.
+
+**Counting `ymm` is only a valid test where OpenSSL is NOT linked statically.**
+On Windows the count went 229 → 0 and that was meaningful. On macOS the shipped
+0.2.13 x86_64 slice disassembles to **20 490** `ymm` references and is
+nevertheless correct: the x86_64 engine links `libcrypto.a` from the contained
+static-deps prefix, and every one of those instructions is inside OpenSSL's own
+hand-written assembly — `rsaz_1024_mul_avx2`, `ossl_rsaz_amm52x40_x2_ifma256`,
+and friends, selected at runtime through `OPENSSL_ia32cap` (there is literally an
+`ossl_rsaz_avxifma_eligible` next to them). Those paths never execute on a CPU
+that lacks the feature. Compiler-emitted `-march=native` code has no such guard,
+which is what made the Windows 229 fatal. So check the compile flags
+(`grep -m1 'FLAGS = ' build/build.ninja` — no `-march`) or, if you disassemble,
+check *which functions* the instructions live in. A bare count will tell you the
+macOS build is broken when it is not.
+
 ## ⚠ Runtime gotcha — `dnssd.dll` load order (important for the Rust app too)
 
 `C:\Windows\System32\dnssd.dll` exists (Apple Bonjour, 2015) and the Win32 DLL

@@ -38,8 +38,10 @@ Release: 1
 Summary: AirPlay receiver — mirror iPhone, iPad or Mac to your screen
 License: GPLv3+
 URL:     https://airplay.popyachsa.com
-# dlopen'd plugins + the daemon (rpm's auto find-requires can't see these):
-Requires: gstreamer1-plugins-base gstreamer1-plugins-good gstreamer1-plugins-bad-free gstreamer1-libav avahi
+# dlopen'd plugins + the daemon (rpm's auto find-requires can't see these), and
+# glib-networking: GIO's TLS backend, loaded by name, without which HTTPS HLS
+# segments fail and AirPlay video dies with "Couldn't download fragments".
+Requires: gstreamer1-plugins-base gstreamer1-plugins-good gstreamer1-plugins-bad-free gstreamer1-libav glib-networking avahi
 Recommends: gstreamer1-vaapi
 AutoReq: yes
 %description

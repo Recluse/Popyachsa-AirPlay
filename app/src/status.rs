@@ -70,14 +70,24 @@ pub fn is_fatal_start_line(msg: &str) -> bool {
     // word mid-sentence during perfectly healthy playback.
     msg.starts_with("stopping")
         // start_dnssd(): the pinned-adapter-vanished case this whole feature
-        // exists for. Both are distinct from the sibling LOGI "dnssd_register_raop
+        // exists for. Distinct from the sibling LOGI "dnssd_register_raop
         // failed: ignoring because Bluetooth LE ..." — which is NOT a failure.
-        || msg.contains("failed with error code")
-        || msg.contains("DNSServiceRegister call returned")
-        || msg.contains("Could not initialize dnssd library!")
+        //
+        // Every one of these is anchored at the start of the line, and that is
+        // the point: `contains` was matching on text a CLIENT controls. The
+        // engine logs track metadata verbatim through this same hook, so a song
+        // called "failed with error code 7" was enough to stop a healthy engine
+        // mid-playback. Anchoring is safe because metadata always arrives
+        // label-prefixed — process_metadata appends "Title: " / "Artist: " /
+        // "Album: " before any value, and only ever appends a value in the
+        // branch that just appended its label.
+        || (msg.starts_with("dnssd_register") && msg.contains("failed with error code"))
+        || msg.starts_with("DNSServiceRegister call returned")
+        || msg.starts_with("No DNS-SD Server found")
+        || msg.starts_with("Could not initialize dnssd library!")
         // start_raop_server(): raop_init/raop_init2 refused (ports held by
         // another instance, bad key file).
-        || msg.contains("Error initializing raop")
+        || msg.starts_with("Error initializing raop")
         // -rc is handled BEFORE parse_arguments, so its two failures never get
         // the "stopping:" wrapper the later ones have — a typo'd -rc in Settings
         // -> Advanced returned -1 with the tray still green. Anchored at the
@@ -130,9 +140,19 @@ mod tests {
             "bound to 192.168.1.50 (mDNS interface index 7); IPv6 and loopback listeners are off",
             // Track metadata is logged verbatim, so a title CAN carry our words —
             // it just cannot carry them at the start of the line (every metadata
-            // line is prefixed with its DMAP label).
+            // line is prefixed with its DMAP label). A client picks these
+            // strings; before the anchors, each one below stopped a healthy
+            // engine mid-playback.
             "Title: startup file was not found",
             "Album: option -rc requires a filename",
+            "Title: dnssd_register failed with error code 7",
+            "Artist: Could not initialize dnssd library!",
+            "Album artist: Error initializing raop!",
+            "Comment: DNSServiceRegister call returned nonsense",
+            "Genre: No DNS-SD Server found",
+            // The real blob is multi-line and arrives as ONE message, so only
+            // the first field's label can ever lead it.
+            "Album: Greatest Hits\nTitle: failed with error code 42\n",
         ] {
             assert!(!is_fatal_start_line(line), "false alarm: {line}");
         }

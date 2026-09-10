@@ -46,8 +46,265 @@ index 9040c51..25213dc 100644
  set(DIR_SRCS ${play_src})
  
  add_library( airplay  STATIC
+diff --git a/lib/airplay_core.cpp b/lib/airplay_core.cpp
+new file mode 100644
+index 0000000..7965368
+--- /dev/null
++++ b/lib/airplay_core.cpp
+@@ -0,0 +1,176 @@
++/*
++ * airplay_core.cpp — implementation of the flat C ABI declared in
++ * airplay_core.h.  Drives the single-instance UxPlay engine: builds an argv
++ * vector from the host's settings and runs the (refactored) main() body
++ * airplay_run_blocking() on a worker thread.
++ *
++ * Compiled into uxplay-core.dll alongside uxplay.cpp + the airplay/renderers
++ * static libs.
++ */
++#define AIRPLAY_CORE_BUILDING
++#include "airplay_core.h"
++
++#include <string>
++#include <vector>
++#include <cctype>    /* isspace(), for the quote-aware argv splitter below */
++#include <thread>
++#include <mutex>
++#include <cstring>
++
++/* Entry points exported by uxplay.cpp (same TU set, C linkage). */
++extern "C" int  airplay_run_blocking(int argc, char *argv[]);
++extern "C" void airplay_request_shutdown(void);
++/* Arms the engine's shutdown latch for a new run.  MUST be called from this
++ * thread before the worker is spawned -- the worker cannot clear it itself
++ * without losing a stop that arrives while it is still starting up. */
++extern "C" void airplay_clear_shutdown_request(void);
++extern "C" void airplay_set_host_window(void *hwnd);
++/* uxplay.cpp's single log-forward hook: log() forwards every line (BEFORE the
++ * level filter) so the host can detect markers ("Begin streaming", "Open
++ * connections: 0", "begin video stream wxh = ..."). Same signature as
++ * airplay_log_cb, so we forward the host's callback straight through. */
++extern "C" void airplay_set_log_forward(airplay_log_cb fn, void *user);
++/* When embedded as a library, cleanup() must RETURN, not exit() the host process
++ * (UxPlay's standalone cleanup() ends with exit(0)). Without this, airplay_core_stop()
++ * -> ... -> cleanup() would kill the whole tray app on Stop/window-close. */
++extern "C" void airplay_set_library_mode(int on);
++
++struct airplay_core {
++    std::string       device_name;
++    std::string       options;      /* extra argv tail, whitespace-separated */
++    void             *hwnd = nullptr;
++
++    airplay_log_cb    log_cb = nullptr;    void *log_user = nullptr;
++
++    std::thread       worker;
++    std::mutex        lifecycle;
++    bool              running = false;
++
++    /* argv storage kept alive for the worker's lifetime */
++    std::vector<std::string> argv_store;
++    std::vector<char *>      argv_ptrs;
++};
++
++/* Split the host's option string into argv tokens.
++ *
++ * MUST STAY QUOTE-AWARE.  The Windows host passes a videosink whose value has
++ * spaces in it -- -vs "d3d11videosink fullscreen-toggle-mode=none ..." -- as a
++ * SINGLE option value (see engine.rs).  A whitespace-only split re-splits that,
++ * parse_arguments() then meets "fullscreen-toggle-mode=none" as an unknown
++ * option, and the engine refuses to start on every Start.  The shipping
++ * uxplay-core.dll was built from a quote-aware source; this is that behaviour,
++ * back in the tree (audit finding 9), so a rebuild from here matches it.
++ *
++ * A token that OPENS with a quote runs to the next quote (quotes stripped, an
++ * unterminated one runs to end of string); anything else runs to whitespace, so
++ * a quote in the middle of a token is an ordinary character.  No backslash
++ * escapes.  That is deliberately narrow, and it is copied VERBATIM from the
++ * canonical fork (Recluse/UxPlay, branch popyachsa-integration) rather than
++ * reimplemented: matching the shipping DLL byte-for-byte is the entire point of
++ * audit finding 9, and a "better" splitter here would recreate the divergence in
++ * a subtler form. Change it there first, then copy it here. */
++static void split_args(const std::string &s, std::vector<std::string> &out) {
++    size_t i = 0, n = s.size();
++    while (i < n) {
++        while (i < n && std::isspace((unsigned char) s[i])) i++;
++        if (i >= n) break;
++        std::string tok;
++        if (s[i] == '"') {
++            i++;                                   /* skip opening quote */
++            while (i < n && s[i] != '"') tok.push_back(s[i++]);
++            if (i < n) i++;                        /* skip closing quote */
++        } else {
++            while (i < n && !std::isspace((unsigned char) s[i])) tok.push_back(s[i++]);
++        }
++        out.push_back(tok);
++    }
++}
++
++extern "C" AIRPLAY_API airplay_core_t *airplay_core_create(void) {
++    airplay_set_library_mode(1); /* cleanup() must return, not exit() the host */
++    return new (std::nothrow) airplay_core();
++}
++
++extern "C" AIRPLAY_API int airplay_core_set_window(airplay_core_t *c, void *hwnd) {
++    if (!c) return -1;
++    c->hwnd = hwnd;
++    return 0;
++}
++
++extern "C" AIRPLAY_API int airplay_core_set_device_name(airplay_core_t *c, const char *utf8) {
++    if (!c) return -1;
++    c->device_name = (utf8 ? utf8 : "");
++    return 0;
++}
++
++extern "C" AIRPLAY_API int airplay_core_set_options(airplay_core_t *c, const char *argv_tail) {
++    if (!c) return -1;
++    c->options = (argv_tail ? argv_tail : "");
++    return 0;
++}
++
++extern "C" AIRPLAY_API void airplay_core_set_log_callback(airplay_core_t *c, airplay_log_cb cb, void *user) {
++    if (!c) return;
++    c->log_cb = cb; c->log_user = user;
++}
++
++extern "C" AIRPLAY_API int airplay_core_start(airplay_core_t *c) {
++    if (!c) return -1;
++    std::lock_guard<std::mutex> lk(c->lifecycle);
++    if (c->running) return -2;
++
++    /* Build argv: [prog, -n, <name>, <options...>]. */
++    c->argv_store.clear();
++    c->argv_ptrs.clear();
++    c->argv_store.push_back("uxplay-core");
++    if (!c->device_name.empty()) {
++        c->argv_store.push_back("-n");
++        c->argv_store.push_back(c->device_name);
++    }
++    split_args(c->options, c->argv_store);
++
++    c->argv_ptrs.reserve(c->argv_store.size() + 1);
++    for (auto &s : c->argv_store) {
++        c->argv_ptrs.push_back(const_cast<char *>(s.c_str()));
++    }
++    c->argv_ptrs.push_back(nullptr);
++
++    /* Hand the host HWND to the renderer before the engine inits video. */
++    airplay_set_host_window(c->hwnd);
++    /* Wire the host log callback so it receives UxPlay's log markers (connect/
++     * disconnect/size). Without this the callback is stored but never called. */
++    airplay_set_log_forward(c->log_cb, c->log_user);
++
++    int argc = static_cast<int>(c->argv_ptrs.size() - 1);
++    char **argv = c->argv_ptrs.data();
++
++    /* Arm the latch here, under c->lifecycle, so it is ordered against
++     * airplay_core_stop(): from now until the worker returns, a stop cannot be
++     * lost, not even one issued before the worker has entered the engine. */
++    airplay_clear_shutdown_request();
++
++    c->running = true;
++    c->worker = std::thread([c, argc, argv]() {
++        airplay_run_blocking(argc, argv);
++    });
++    return 0;
++}
++
++extern "C" AIRPLAY_API void airplay_core_stop(airplay_core_t *c) {
++    if (!c) return;
++    std::lock_guard<std::mutex> lk(c->lifecycle);
++    if (!c->running) return;
++    airplay_request_shutdown();
++    if (c->worker.joinable()) {
++        c->worker.join();
++    }
++    c->running = false;
++    airplay_set_host_window(nullptr);
++    airplay_set_log_forward(nullptr, nullptr);
++}
++
++extern "C" AIRPLAY_API void airplay_core_destroy(airplay_core_t *c) {
++    if (!c) return;
++    airplay_core_stop(c);
++    delete c;
++}
+diff --git a/lib/airplay_core.h b/lib/airplay_core.h
+new file mode 100644
+index 0000000..218552e
+--- /dev/null
++++ b/lib/airplay_core.h
+@@ -0,0 +1,69 @@
++/*
++ * airplay_core.h — flat C ABI for embedding the UxPlay AirPlay engine
++ * in-process (Plan B).  Built into uxplay-core.dll (MinGW/UCRT64) and consumed
++ * by an MSVC-built Rust host via hand-written FFI.  Only POD + opaque pointers
++ * cross this boundary — NO GLib / GStreamer / C++ types — so the ABI is stable
++ * across compilers.
++ *
++ * The engine is single-instance: airplay_core_create() hands back an opaque
++ * handle, but internally drives the file-static UxPlay globals.  Do not run two
++ * instances concurrently.
++ */
++#ifndef AIRPLAY_CORE_H
++#define AIRPLAY_CORE_H
++
++#include <stdint.h>
++
++#ifdef _WIN32
++#  ifdef AIRPLAY_CORE_BUILDING
++#    define AIRPLAY_API __declspec(dllexport)
++#  else
++#    define AIRPLAY_API __declspec(dllimport)
++#  endif
++#else
++#  define AIRPLAY_API
++#endif
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Opaque handle.  Single-instance internally; reserved for a future multi-
++ * instance refactor. */
++typedef struct airplay_core airplay_core_t;
++
++/* level mirrors UxPlay's logger.h numeric levels (LOGGER_ERR=3 .. DEBUG). */
++typedef void (*airplay_log_cb)(int level, const char *msg, void *user);
++
++AIRPLAY_API airplay_core_t *airplay_core_create(void);
++
++/* Renderer host window (HWND on Windows).  Pass the window WE own; the engine
++ * renders into it via GstVideoOverlay instead of creating its own.  Pass NULL
++ * to let the engine create its own window (B2 smoke-test mode). */
++AIRPLAY_API int  airplay_core_set_window(airplay_core_t *c, void *hwnd);
++
++/* Name shown in the iPhone/Mac AirPlay picker (UxPlay -n). UTF-8. */
++AIRPLAY_API int  airplay_core_set_device_name(airplay_core_t *c, const char *utf8);
++
++/* Extra UxPlay-style argv tokens as one whitespace-separated string, e.g.
++ * "-vs d3d11videosink -vd nvh264dec -fps 60 -nh -nohold".  Split QUOTE-AWARE:
++ * an option value containing spaces must be wrapped in "..." to stay one
++ * token, as the Windows host does for its -vs value. */
++AIRPLAY_API int  airplay_core_set_options(airplay_core_t *c, const char *argv_tail);
++
++AIRPLAY_API void airplay_core_set_log_callback(airplay_core_t *c, airplay_log_cb cb, void *user);
++
++/* Start the RAOP server + GStreamer on a dedicated worker thread; returns
++ * immediately.  Non-zero return = failed to start (e.g. already running). */
++AIRPLAY_API int  airplay_core_start(airplay_core_t *c);
++
++/* Signal the internal GMainLoop to quit and join the worker.  Idempotent. */
++AIRPLAY_API void airplay_core_stop(airplay_core_t *c);
++
++AIRPLAY_API void airplay_core_destroy(airplay_core_t *c);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* AIRPLAY_CORE_H */
 diff --git a/lib/airplay_video.c b/lib/airplay_video.c
-index 19505b2..64af2a1 100644
+index 19505b2..1f5aa2e 100644
 --- a/lib/airplay_video.c
 +++ b/lib/airplay_video.c
 @@ -25,6 +25,7 @@
@@ -78,6 +335,67 @@ index 19505b2..64af2a1 100644
      size_t len = strlen(uri) + strlen(port);
      airplay_video->local_uri_prefix = (char *) calloc (len + 1, sizeof(char));
      strcat(airplay_video->local_uri_prefix, uri);
+@@ -887,7 +892,38 @@ char *adjust_yt_condensed_playlist(const char *media_playlist) {
+ 
+     size_t old_size = strlen(media_playlist);
+     size_t new_len = old_size;
+-    new_len += count * (base_uri_len + params_len);
++    /* PATCH (Plan B): was `count * (base_uri_len + params_len)`, which is short by
++       (prefix_len - 2) FOR EVERY CHUNK.  Each chunk writes two '/' separators per
++       parameter while the comma between parameters is not copied, so the real
++       growth is base_uri_len + params_len + 2 - prefix_len.  Two consequences,
++       both measured:
++         * prefix_len < 2  -> the buffer is too small and the expansion writes
++           past it; ASan reports a heap-buffer-overflow.
++         * prefix_len > 2  -> the buffer is LONGER than what is written, and the
++           bytes between are uninitialised malloc memory.  http_handlers.h sets
++           the HTTP response length with strlen() on this buffer, so a media
++           playlist served to the player carries heap garbage after
++           #EXT-X-ENDLIST -- (prefix_len - 2) bytes per chunk, which for a
++           ~1000-chunk YouTube VOD is kilobytes of it.
++       `assert(byte_count == new_len)` below was supposed to catch this; it is
++       compiled out of Release builds (-DNDEBUG: the macOS bundle) and live in
++       the Windows/Linux builds, which set no build type.
++       Over-allocate by prefix_len instead of computing exactly (a subtraction on
++       size_t underflows if a future format has a longer prefix than the rest),
++       and terminate at what was actually written.
++
++       CORRECTION (2026-09-10): this fix did NOT make AirPlay video play, as its
++       commit message claimed.  YouTube sends PREFIX="s/" (prefix_len 2), for
++       which the old size is exact.  Measured on Windows with a real iPhone,
++       cores differing in exactly this hunk, two clips each: byte-identical
++       outcomes -- both play, both with subtitles.  What made Windows play was
++       bundling the GIO TLS backend (removing lib/gio/modules/ alone reproduces
++       the failure, "Couldn't download fragments"); what made macOS play was
++       bundling the HLS plugins and TEXT off (see video_renderer.c).  This hunk
++       is correct for prefix_len != 2 and a no-op on real traffic.  Upstream
++       rewrote the function with the exact formula (575c562); drop this hunk on
++       rebase. */
++    new_len += count * (base_uri_len + params_len + 2);
+ 
+     int byte_count = 0;
+     char * new_playlist = (char *) malloc(new_len + 1);
+@@ -895,7 +931,6 @@ char *adjust_yt_condensed_playlist(const char *media_playlist) {
+         printf("Memory allocation failure (new_playlist)\n");
+         exit(1);
+     }
+-    new_playlist[new_len] = '\0';
+     const char *old_pos = media_playlist;
+     char *new_pos = new_playlist;
+     ptr = old_pos;
+@@ -965,7 +1000,11 @@ char *adjust_yt_condensed_playlist(const char *media_playlist) {
+     new_pos += len;
+     old_pos += len;
+ 
+-    assert(byte_count == (int) new_len);
++    /* Terminate where the content ENDS, not at the end of the allocation. */
++    *new_pos = '\0';
++    /* The first term alone is a tautology (both count the same writes); the
++       second is the one that catches a short buffer. */
++    assert(byte_count == (int) (new_pos - new_playlist) && byte_count <= (int) new_len);
+ 
+     free (prefix);
+     free (base_uri);
 diff --git a/lib/dnssd.c b/lib/dnssd.c
 index d041ee7..5b59646 100644
 --- a/lib/dnssd.c
@@ -573,8 +891,184 @@ index 7568bcd..0c85b8c 100644
  }
  
  void audio_renderer_stop() {
+diff --git a/renderers/avsample_sink.m b/renderers/avsample_sink.m
+new file mode 100644
+index 0000000..c393a67
+--- /dev/null
++++ b/renderers/avsample_sink.m
+@@ -0,0 +1,170 @@
++// avsample_sink.m — custom macOS video sink (Plan B).
++//
++// Bypasses GStreamer's buggy applemedia sinks (avsamplebufferlayersink UAF on
++// caps-change, osxvideosink teardown deadlock): we pull decoded NV12 frames from
++// an `appsink` (video_renderer.c) and feed them to OUR OWN
++// AVSampleBufferDisplayLayer, hosted in the app's NSView. Because we own the
++// layer and the enqueue path, there is no framework UAF and no main-thread
++// teardown deadlock, and the layer scales cleanly on resize/rotation.
++//
++// Compiled as Objective-C (ARC) into the `renderers` lib; exposed to the C TU
++// video_renderer.c via the small C ABI below.
++
++#import <AVFoundation/AVFoundation.h>
++#import <AppKit/AppKit.h>
++#import <CoreVideo/CoreVideo.h>
++#import <CoreMedia/CoreMedia.h>
++
++// --- C ABI (called from video_renderer.c) -------------------------------------
++void *avlayer_sink_create(void *nsview_ptr);
++void  avlayer_sink_enqueue_nv12(void *sink, const unsigned char *y, unsigned long y_stride,
++                                const unsigned char *uv, unsigned long uv_stride,
++                                int width, int height);
++void  avlayer_sink_destroy(void *sink);
++
++typedef struct AVLayerSink {
++    // CFBridgingRetain'd AVSampleBufferDisplayLayer. _Atomic because create()
++    // publishes it from the main queue while the GStreamer streaming thread is
++    // already calling enqueue().
++    _Atomic(void *) layer;
++} AVLayerSink;
++
++/// Create the display layer and host it in `nsview` (AppKit work on the main thread).
++///
++/// MUST NOT dispatch_sync to the main queue — same hazard as destroy() below: this
++/// runs on the engine worker, and a host that quits mid-connect blocks its main
++/// thread inside airplay_core_stop() joining that worker, so a sync hop would
++/// deadlock with no window and no tray. So: inline if already on main, else
++/// fire-and-forget. The caller only needs the AVLayerSink handle (it is appsink
++/// callback userdata); enqueue() drops the first frames until `layer` is published,
++/// which is a few ms at stream start and invisible.
++void *avlayer_sink_create(void *nsview_ptr) {
++    if (!nsview_ptr) return NULL;
++    AVLayerSink *s = (AVLayerSink *)calloc(1, sizeof(AVLayerSink));
++    if (!s) return NULL;
++    NSView *view = (__bridge NSView *)nsview_ptr;
++    void (^build)(void) = ^{
++        AVSampleBufferDisplayLayer *layer = [[AVSampleBufferDisplayLayer alloc] init];
++        layer.videoGravity = AVLayerVideoGravityResizeAspect; // honest aspect, letterbox
++        view.wantsLayer = YES;
++        CALayer *backing = view.layer;
++        backing.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
++        layer.frame = view.bounds;
++        layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
++        // kCALayerWidthSizable | kCALayerHeightSizable -> follows the view on resize
++        layer.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
++        [backing addSublayer:layer];
++        s->layer = (void *)CFBridgingRetain(layer);
++    };
++    if ([NSThread isMainThread]) {
++        build();
++    } else {
++        dispatch_async(dispatch_get_main_queue(), build);
++    }
++    return s;
++}
++
++/// Wrap an NV12 frame in a CVPixelBuffer + CMSampleBuffer and enqueue it. Safe to
++/// call from the GStreamer streaming thread (AVSampleBufferDisplayLayer enqueue is
++/// thread-safe). Frames are tagged display-immediately (lowest latency).
++void avlayer_sink_enqueue_nv12(void *sink_, const unsigned char *y, unsigned long y_stride,
++                               const unsigned char *uv, unsigned long uv_stride,
++                               int width, int height) {
++    AVLayerSink *s = (AVLayerSink *)sink_;
++    if (!s || !s->layer || !y || !uv || width <= 0 || height <= 0) return;
++    AVSampleBufferDisplayLayer *layer = (__bridge AVSampleBufferDisplayLayer *)s->layer;
++
++    // If the layer failed (e.g. went to background), flush so it accepts frames again.
++    if (layer.status == AVQueuedSampleBufferRenderingStatusFailed) {
++        [layer flush];
++    }
++
++    CVPixelBufferRef pb = NULL;
++    CVReturn rc;
++    // The caller is a GStreamer streaming thread, which has no autorelease pool of
++    // its own: an autoreleased literal there is held until the thread dies. Only
++    // this dictionary is autorelease-prone, so scope a pool around just it.
++    @autoreleasepool {
++        NSDictionary *attrs = @{ (id)kCVPixelBufferIOSurfacePropertiesKey : @{} };
++        rc = CVPixelBufferCreate(kCFAllocatorDefault, width, height,
++                                 kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
++                                 (__bridge CFDictionaryRef)attrs, &pb);
++    }
++    if (rc != kCVReturnSuccess || !pb) return;
++
++    if (CVPixelBufferLockBaseAddress(pb, 0) != kCVReturnSuccess) {
++        CVPixelBufferRelease(pb); // never unlock a lock that did not succeed
++        return;
++    }
++    unsigned char *dy = (unsigned char *)CVPixelBufferGetBaseAddressOfPlane(pb, 0);
++    unsigned long dys = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
++    for (int row = 0; row < height; row++) {
++        memcpy(dy + (unsigned long)row * dys, y + (unsigned long)row * y_stride, (size_t)width);
++    }
++    unsigned char *duv = (unsigned char *)CVPixelBufferGetBaseAddressOfPlane(pb, 1);
++    unsigned long duvs = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
++    for (int row = 0; row < height / 2; row++) {
++        memcpy(duv + (unsigned long)row * duvs, uv + (unsigned long)row * uv_stride, (size_t)width);
++    }
++    CVPixelBufferUnlockBaseAddress(pb, 0);
++
++    CMVideoFormatDescriptionRef fmt = NULL;
++    if (CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pb, &fmt) != noErr || !fmt) {
++        CVPixelBufferRelease(pb);
++        return;
++    }
++
++    CMSampleTimingInfo timing = { kCMTimeInvalid, kCMTimeInvalid, kCMTimeInvalid };
++    CMSampleBufferRef sb = NULL;
++    OSStatus st = CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault, pb, fmt, &timing, &sb);
++    if (st == noErr && sb) {
++        CFArrayRef atts = CMSampleBufferGetSampleAttachmentsArray(sb, true);
++        if (atts && CFArrayGetCount(atts) > 0) {
++            CFMutableDictionaryRef d = (CFMutableDictionaryRef)CFArrayGetValueAtIndex(atts, 0);
++            CFDictionarySetValue(d, kCMSampleAttachmentKey_DisplayImmediately, kCFBooleanTrue);
++        }
++        [layer enqueueSampleBuffer:sb];
++        CFRelease(sb);
++    }
++    CFRelease(fmt);
++    CVPixelBufferRelease(pb);
++}
++
++/// Detach + release the layer (AppKit work must run on the main thread).
++///
++/// MUST NOT dispatch_sync to the main queue: teardown runs on the engine worker
++/// while the main thread is blocked inside airplay_core_stop() joining that very
++/// worker (X-button restart) — a sync hop would deadlock. So we run inline if we
++/// are already on main, else fire-and-forget via dispatch_async. The block only
++/// captures `s`, whose ownership passes to the block (single CFBridgingRelease
++/// transfers the layer exactly once).
++///   * On restart the async cleanup drains FIFO before the next create() bind (the
++///     serial main queue + distinct CALayer instances keep the layer tree correct).
++///   * On app quit the process exit()s before the main queue drains again, so the
++///     block is simply abandoned — harmless, teardown at exit is moot.
++///
++/// Reading `s->layer` and freeing `s` happen INSIDE the block, not before it:
++/// create() may still have its own block queued ahead of ours, so the layer only
++/// exists once that has run, and an earlier free() would let it write freed memory.
++/// The serial main queue gives us that ordering because create() and destroy() are
++/// always called from the same thread (the engine worker, or main in standalone
++/// uxplay) — the pairing that video_renderer.c enforces.
++void avlayer_sink_destroy(void *sink_) {
++    AVLayerSink *s = (AVLayerSink *)sink_;
++    if (!s) return;
++    void (^cleanup)(void) = ^{
++        void *layer_ref = s->layer;
++        s->layer = NULL;
++        if (layer_ref) {
++            AVSampleBufferDisplayLayer *layer = (AVSampleBufferDisplayLayer *)CFBridgingRelease(layer_ref);
++            [layer flush];
++            [layer removeFromSuperlayer];
++        }
++        free(s);
++    };
++    if ([NSThread isMainThread]) {
++        cleanup();
++    } else {
++        dispatch_async(dispatch_get_main_queue(), cleanup);
++    }
++}
 diff --git a/renderers/video_renderer.c b/renderers/video_renderer.c
-index ea1c450..3160ff3 100644
+index ea1c450..e2d5bb9 100644
 --- a/renderers/video_renderer.c
 +++ b/renderers/video_renderer.c
 @@ -20,10 +20,59 @@
@@ -650,6 +1144,15 @@ index ea1c450..3160ff3 100644
  static bool auto_videosink = true;
  static bool hls_video = false;
  #ifdef X_DISPLAY_FIX
+@@ -61,7 +111,7 @@ static int type_jpeg = 0;
+ typedef enum {
+   //GST_PLAY_FLAG_VIDEO         = (1 << 0),
+   //GST_PLAY_FLAG_AUDIO         = (1 << 1),
+-  //GST_PLAY_FLAG_TEXT          = (1 << 2),
++  GST_PLAY_FLAG_TEXT          = (1 << 2),
+   //GST_PLAY_FLAG_VIS           = (1 << 3),
+   //GST_PLAY_FLAG_SOFT_VOLUME   = (1 << 4),
+   //GST_PLAY_FLAG_NATIVE_AUDIO  = (1 << 5),
 @@ -78,6 +128,7 @@ typedef enum {
  
  struct video_renderer_s {
@@ -742,30 +1245,108 @@ index ea1c450..3160ff3 100644
  }
  
  GstElement *make_video_sink(const char *videosink, const char *videosink_options) {
-@@ -311,9 +422,20 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
+@@ -300,20 +411,96 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
+             g_assert(renderer_type[i]->pipeline);
+             renderer_type[i]->codec = hls;
+             /* if we are not using an autovideosink, build a videosink based on the string "videosink" */
+-            if (!auto_videosink) { 
+-                GstElement *playbin_videosink = make_video_sink(videosink, videosink_options);  
++            if (!auto_videosink) {
++#ifdef __APPLE__
++            /* PATCH (Plan B / macOS): "avlayer" is NOT a registered GStreamer element
++             * -- it is this fork's appsink -> AVSampleBufferDisplayLayer path, and it
++             * was only ever wired into the MIRROR pipeline below.  Here
++             * gst_element_factory_make("avlayer") returns NULL -- nothing in this
++             * fork ever calls gst_element_register(), and no bundled plugin provides
++             * that factory -- so playbin logged "failed to create
++             * playbin_videosink" and fell back to its own
++             * autovideosink, whose only candidate in this bundle is
++             * avsamplebufferlayersink -- the framework sink this fork abandoned for
++             * the UAF on caps-change, and one that renders into a layer of its own
++             * rather than the host NSView.  Give playbin the same appsink bin the
++             * mirror pipeline uses and bind it to the host NSView.
++             * sync=true (NOT the mirror's sync=false): HLS is a timestamped VOD
++             * stream, so the sink -- not the arrival rate -- is the clock. */
++            if (!strcmp(videosink, "avlayer")) {
++                GError *berr = NULL;
++                void *hostview = airplay_get_host_window();
++                GstElement *sinkbin = gst_parse_bin_from_description(
++                    "videoconvert ! video/x-raw,format=NV12 ! appsink name=avlayer_hls"
++                    " emit-signals=false sync=true max-buffers=3 drop=true", TRUE, &berr);
++                GstElement *asink = sinkbin ?
++                    gst_bin_get_by_name(GST_BIN(sinkbin), "avlayer_hls") : NULL;
++                if (!hostview || !asink) {
++                    logger_log(logger, LOGGER_ERR,
++                               "video_renderer_init: no hls avlayer sink (%s) -- playbin picks its own",
++                               berr ? berr->message : (hostview ? "appsink missing" : "no host window"));
++                    if (sinkbin) gst_object_unref(sinkbin);
++                } else {
++                    renderer_type[i]->avlayer = avlayer_sink_create(hostview);
++                    GstAppSinkCallbacks cbs;
++                    memset(&cbs, 0, sizeof(cbs));
++                    cbs.new_sample = avlayer_on_new_sample;
++                    gst_app_sink_set_callbacks(GST_APP_SINK(asink), &cbs,
++                                               renderer_type[i]->avlayer, NULL);
++                    g_object_set(G_OBJECT (renderer_type[i]->pipeline), "video-sink", sinkbin, NULL);
++                    logger_log(logger, LOGGER_INFO,
++                               "avlayer: bound hls playbin appsink to host NSView %p%s", hostview,
++                               renderer_type[i]->avlayer ? "" : " (LAYER CREATE FAILED)");
++                }
++                if (asink) gst_object_unref(asink);
++                g_clear_error(&berr);
++            } else
++#endif
++              {
++                GstElement *playbin_videosink = make_video_sink(videosink, videosink_options);
+                 if (!playbin_videosink) {
+                     logger_log(logger, LOGGER_ERR, "video_renderer_init: failed to create playbin_videosink");
+                 } else {
+                     logger_log(logger, LOGGER_DEBUG, "video_renderer_init: create playbin_videosink at %p", playbin_videosink);
+                     g_object_set(G_OBJECT (renderer_type[i]->pipeline), "video-sink", playbin_videosink, NULL);
+                 }
++              }
              }
              gint flags = 0;
              g_object_get(renderer_type[i]->pipeline, "flags", &flags, NULL);
 -            flags |= GST_PLAY_FLAG_DOWNLOAD;
 -            flags |= GST_PLAY_FLAG_BUFFERING;    // set by default in playbin3, but not in playbin2; is it needed?
-+            /* PATCH (media-mode lag-reduction): for AirPlay HLS, source is iPhone in LAN.
-+             * Disable DOWNLOAD (no disk cache, adds IO latency) and BUFFERING (preroll wait).
-+             * Combined with buffer-duration=0, buffer-size=0, this minimizes startup latency
-+             * and live-edge delay. */
++            /* PATCH (media-mode lag-reduction), CORRECTED.  It used to also clear
++             * BUFFERING and set buffer-duration/size to 0, on the stated grounds
++             * that "source is iPhone in LAN" -- which is true of MIRRORING and
++             * false of exactly the path this branch is.  In the AirPlay video
++             * protocol the phone hands over a URL and GStreamer fetches the
++             * segments from the sender's CDN over the internet; there is no
++             * preroll reserve to give away.  Measured on Windows with a real
++             * iPhone: with buffering off the picture froze on its first frame
++             * while the phone's clock ran on; with buffering restored it played,
++             * and the owner's remaining complaint was a slow START -- the cost of
++             * having no reserve.  DOWNLOAD stays off (an on-disk cache buys a
++             * receiver nothing), buffering goes back to the default. */
 +            flags &= ~GST_PLAY_FLAG_DOWNLOAD;
-+            flags &= ~GST_PLAY_FLAG_BUFFERING;
++            /* PATCH (macOS bundle): TEXT off.  A receiver has no subtitle UI, but
++             * playbin still opens a text branch for any WebVTT rendition a master
++             * playlist advertises -- and with no webvttdec/timed-text decoder it
++             * sits at "buffering 0%" FOREVER, logging only a "Missing element"
++             * WARNING.  That is a silent hang indistinguishable from the missing
++             * plugins this same release fixes.  Measured: identical stream +
++             * identical bundle, TEXT set -> never prerolls; TEXT clear -> plays.
++             * Clearing it also keeps subparse/pango (+13 MB of font stack) out of
++             * the bundle.
++             * Measured on macOS only.  On Windows (2026-09-10, four runs with a
++             * real iPhone) the bundle HAS subparse: YouTube's caption rendition
++             * (DEFAULT=NO,AUTOSELECT=YES) is auto-selected by decodebin3 whether
++             * or not CC is on at the phone, and it renders -- so there this line
++             * removes working subtitles.  Kept unconditional until the Linux
++             * bundle is checked for subparse; see BACKLOG "TEXT off". */
++            flags &= ~GST_PLAY_FLAG_TEXT;
              g_object_set(renderer_type[i]->pipeline, "flags", flags, NULL);
-+            g_object_set(renderer_type[i]->pipeline,
-+                         "buffer-duration", (gint64) 0,
-+                         "buffer-size",     (gint)  0,
-+                         NULL);
 +            logger_log(logger, LOGGER_INFO,
-+                       "playbin%u configured for low-latency HLS: flags=0x%x buffer-duration=0 buffer-size=0",
++                       "playbin%u configured for HLS: flags=0x%x (buffering left at the default)",
 +                       playbin_version, flags);
              //g_object_set (G_OBJECT (renderer_type[i]->pipeline), "uri", uri, NULL);
          } else {
              bool jpeg_pipeline = false;
-@@ -334,6 +456,9 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
+@@ -334,6 +521,9 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
              if (jpeg_pipeline) {
                  g_string_append(launch, "jpegdec ");
              } else {
@@ -775,7 +1356,7 @@ index ea1c450..3160ff3 100644
                  g_string_append(launch, "queue ! ");
                  g_string_append(launch, parser);
                  g_string_append(launch, " ! ");
-@@ -347,12 +472,37 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
+@@ -347,12 +537,37 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
              if (!rtp || jpeg_pipeline) {
                  g_string_append(launch, " ! ");
                  append_videoflip(launch, &videoflip[0], &videoflip[1]);
@@ -814,7 +1395,7 @@ index ea1c450..3160ff3 100644
                  g_string_append(launch, videosink);
                  g_string_append(launch, " name=");
                  g_string_append(launch, videosink);
-@@ -361,11 +511,14 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
+@@ -361,11 +576,14 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
                  g_string_append(launch, videosink_options);
                  if (video_sync && !jpeg_pipeline) {
                      g_string_append(launch, " sync=true");
@@ -831,7 +1412,7 @@ index ea1c450..3160ff3 100644
              }
              if (!strcmp(renderer_type[i]->codec, h264)) {
                  char *pos = launch->str;
-@@ -399,7 +552,188 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
+@@ -399,7 +617,188 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
              gst_pipeline_use_clock(GST_PIPELINE_CAST(renderer_type[i]->pipeline), clock);
              renderer_type[i]->appsrc = gst_bin_get_by_name (GST_BIN (renderer_type[i]->pipeline), "video_source");
              g_assert(renderer_type[i]->appsrc);
@@ -1020,7 +1601,7 @@ index ea1c450..3160ff3 100644
              g_string_free(launch, TRUE);
              gst_caps_unref(caps);
              gst_object_unref(clock);
-@@ -452,7 +786,11 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
+@@ -452,7 +851,11 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
                         "\nor your choices of video options (-vs -vd -vc -fs etc.) are incompatible on"
                         "\nthis computer architecture.  (An example: kmssink with fullscreen option -fs"
                         "\nmay work on some systems, but fail on others)");
@@ -1033,7 +1614,7 @@ index ea1c450..3160ff3 100644
          }
      }
  }
-@@ -483,7 +821,19 @@ void video_renderer_resume() {
+@@ -483,7 +886,19 @@ void video_renderer_resume() {
  void video_renderer_start() {
      GstState state;
      const gchar *state_name = NULL;
@@ -1053,7 +1634,7 @@ index ea1c450..3160ff3 100644
          g_object_set (G_OBJECT (renderer->pipeline), "uri", renderer->uri, NULL);
          gst_element_set_state (renderer->pipeline, GST_STATE_PAUSED);
  	gst_element_get_state(renderer->pipeline, &state, NULL, 1000 * GST_MSECOND);
-@@ -493,6 +843,7 @@ void video_renderer_start() {
+@@ -493,6 +908,7 @@ void video_renderer_start() {
      } 
      /* when not hls, start both h264 and h265 pipelines; will shut down the "wrong" one when we know the codec */
      for (int i = 0; i < n_renderers; i++) {
@@ -1061,7 +1642,7 @@ index ea1c450..3160ff3 100644
          gst_element_set_state (renderer_type[i]->pipeline, GST_STATE_PAUSED);
          gst_element_get_state(renderer_type[i]->pipeline, &state, NULL, 1000 * GST_MSECOND);
          state_name = gst_element_state_get_name(state);
-@@ -508,7 +859,10 @@ void video_renderer_start() {
+@@ -508,7 +924,10 @@ void video_renderer_start() {
  /* used to find any X11 Window used by the playbin (HLS) pipeline after it starts playing. 
  *  if use_x11 is true, called every 100 ms after playbin state is READY until the x11 window is found*/
  bool waiting_for_x11_window() {
@@ -1073,7 +1654,7 @@ index ea1c450..3160ff3 100644
          return false;
      }
  #ifdef X_DISPLAY_FIX
-@@ -584,7 +938,7 @@ uint64_t video_renderer_render_buffer(unsigned char* data, int *data_len, int *n
+@@ -584,7 +1003,7 @@ uint64_t video_renderer_render_buffer(unsigned char* data, int *data_len, int *n
      GstBuffer *buffer = NULL;
      GstClockTime pts = (GstClockTime) *ntp_time; /*now in nsecs */
      //GstClockTimeDiff latency = GST_CLOCK_DIFF(gst_element_get_current_clock_time (renderer->appsrc), pts);
@@ -1082,7 +1663,7 @@ index ea1c450..3160ff3 100644
          if (pts >= gst_video_pipeline_base_time) {
              pts -= gst_video_pipeline_base_time;
          } else {
-@@ -613,7 +967,7 @@ uint64_t video_renderer_render_buffer(unsigned char* data, int *data_len, int *n
+@@ -613,7 +1032,7 @@ uint64_t video_renderer_render_buffer(unsigned char* data, int *data_len, int *n
          buffer = gst_buffer_new_allocate(NULL, *data_len, NULL);
          g_assert(buffer != NULL);
          //g_print("video latency %8.6f\n", (double) latency / SECOND_IN_NSECS);
@@ -1091,7 +1672,7 @@ index ea1c450..3160ff3 100644
              GST_BUFFER_PTS(buffer) = pts;
          }
          gst_buffer_fill(buffer, 0, data, *data_len);
-@@ -714,9 +1068,24 @@ static void video_renderer_destroy_instance(video_renderer_t *renderer) {
+@@ -714,9 +1133,24 @@ static void video_renderer_destroy_instance(video_renderer_t *renderer) {
          if (renderer->textsrc) {
              gst_object_unref (renderer->textsrc);
              renderer->textsrc = NULL;
@@ -1117,7 +1698,7 @@ index ea1c450..3160ff3 100644
  #ifdef X_DISPLAY_FIX
          if (renderer->gst_window){
  	  // free_X11_Display(renderer->gst_window);   without this, a memory leak; with it, a coredump
-@@ -737,6 +1106,7 @@ void video_renderer_destroy() {
+@@ -737,6 +1171,7 @@ void video_renderer_destroy() {
      for (int i = 0; i < n_renderers; i++) {
          if (renderer_type[i]) {
              video_renderer_destroy_instance(renderer_type[i]);
@@ -1125,7 +1706,26 @@ index ea1c450..3160ff3 100644
          }
      }
  }
-@@ -1041,7 +1411,12 @@ int video_renderer_choose_codec (bool video_is_jpeg, bool video_is_h265) {
+@@ -930,7 +1365,17 @@ static gboolean gstreamer_video_pipeline_bus_callback(GstBus *bus, GstMessage *m
+             if (new_state != GST_STATE_PLAYING) {
+                 hls_playing = FALSE;
+                 break;
+-            } 
++            }
++            if (!hls_playing) {
++                /* PATCH (Plan B / macOS host): the host shows + fits its mirror
++                 * window on the "Begin streaming" marker, which video_renderer_render_buffer()
++                 * emits on the first MIRROR packet -- a code path the HLS video
++                 * protocol never touches, so the picture landed in a window that
++                 * was still hidden.  playbin reaching PLAYING is the HLS equivalent
++                 * of that first packet.  (No wxh line: playbin knows the size, the
++                 * layer letterboxes into whatever window size the host chose.) */
++                logger_log(logger, LOGGER_INFO, "Begin streaming HLS video to GStreamer playbin");
++            }
+             hls_playing = TRUE;
+             GstQuery *query = NULL;
+             query = gst_query_new_seeking(GST_FORMAT_TIME);
+@@ -1041,7 +1486,12 @@ int video_renderer_choose_codec (bool video_is_jpeg, bool video_is_h265) {
      gst_element_set_state (renderer->pipeline, GST_STATE_PLAYING);
      GstState old_state, new_state;
      if (gst_element_get_state(renderer->pipeline, &old_state, &new_state, 100 * GST_MSECOND) == GST_STATE_CHANGE_FAILURE) {
@@ -1139,7 +1739,7 @@ index ea1c450..3160ff3 100644
          return -1;
      }
      logger_log(logger, LOGGER_DEBUG, "video_pipeline state change from %s to %s\n",
-@@ -1061,6 +1436,11 @@ int video_renderer_choose_codec (bool video_is_jpeg, bool video_is_h265) {
+@@ -1061,6 +1511,11 @@ int video_renderer_choose_codec (bool video_is_jpeg, bool video_is_h265) {
              video_renderer_destroy_instance(renderer_unused);
          }
      }
@@ -1151,7 +1751,7 @@ index ea1c450..3160ff3 100644
      return 0;
  }
      
-@@ -1141,13 +1521,27 @@ void video_renderer_seek(float position) {
+@@ -1141,13 +1596,27 @@ void video_renderer_seek(float position) {
  
  unsigned int video_renderer_listen(void *loop, int id) {
      g_assert(id >= 0 && id < n_renderers);
@@ -1196,7 +1796,7 @@ index fd48415..01a6ba5 100644
  bool video_get_playback_info(double *duration, double *position, double *seek_start, double *seek_duration, float *rate, bool *buffer_empty, bool *buffer_full);
  int video_renderer_choose_codec (bool video_is_jpeg, bool video_is_h265);
 diff --git a/uxplay.cpp b/uxplay.cpp
-index 06e528c..214c83e 100644
+index 06e528c..9f0231d 100644
 --- a/uxplay.cpp
 +++ b/uxplay.cpp
 @@ -24,6 +24,7 @@
@@ -1936,7 +2536,7 @@ index 06e528c..214c83e 100644
              }
              i++;
              db_low = db1;
-@@ -1708,22 +1939,32 @@ static void parse_arguments (int argc, char *argv[]) {
+@@ -1708,22 +1939,39 @@ static void parse_arguments (int argc, char *argv[]) {
                          //db = (db > db_flat) ? db : db_flat;
                          initial_volume = db_flat;
                      }
@@ -1964,10 +2564,17 @@ index 06e528c..214c83e 100644
              if (i < argc - 1 && *argv[i+1] != '-') {
                  unsigned int n = 3;
 -                if (!get_value(argv[++i], &n) || playbin_version < 2) {
-+                /* PATCH (Plan B): this tested playbin_version (still the default 3
-+                   here) instead of the value just parsed, so "-hls 4" was accepted
-+                   and reached video_renderer_init's g_assert(0) -- an abort that
-+                   takes the whole host app down, from a typo in Settings. */
++                /* PATCH (Plan B): the value that gets through here is "-hls 1",
++                   NOT "-hls 4" as an earlier version of this comment claimed --
++                   measured against upstream, which rejects 4 and accepts 1.
++                   get_value() treats the initial *n as a MAXIMUM, so 0 and >3 are
++                   already refused; and the old second test, `playbin_version < 2`,
++                   can never fire because playbin_version is still its default
++                   here. So 1 is stored, and video_renderer_init's playbin switch
++                   has no case 1: g_assert(0), which aborts the whole host app --
++                   not at startup, where uri is NULL, but the first time someone
++                   casts a video. `n > 3` below is redundant with get_value and
++                   kept only so the accepted range reads at a glance. */
 +                if (!get_value(argv[++i], &n) || n < 2 || n > 3) {
                      fprintf(stderr, "invalid \"-hls %s\"; -hls n only allows \"playbin\" video player versions 2 or 3\n", argv[i]);
 -                    exit(1);
@@ -1975,7 +2582,7 @@ index 06e528c..214c83e 100644
                  }
                  playbin_version = (guint) n;
              }
-@@ -1738,9 +1979,10 @@ static void parse_arguments (int argc, char *argv[]) {
+@@ -1738,9 +1986,10 @@ static void parse_arguments (int argc, char *argv[]) {
              nofreeze = true;
          } else {
              fprintf(stderr, "unknown option %s, stopping (for help use option \"-h\")\n",argv[i]);
@@ -1987,7 +2594,7 @@ index 06e528c..214c83e 100644
  }
  
  static void process_metadata(int count, const char *dmap_tag, const unsigned char* metadata, int datalen, std::string *metadata_text) {
-@@ -1863,15 +2105,12 @@ static void process_metadata(int count, const char *dmap_tag, const unsigned cha
+@@ -1863,15 +2112,12 @@ static void process_metadata(int count, const char *dmap_tag, const unsigned cha
      }
  
      if (dmap_type == 9) {
@@ -2008,7 +2615,7 @@ index 06e528c..214c83e 100644
      } else if (debug_log) {
          std::string md = "";
          char hex[4];
-@@ -1913,7 +2152,33 @@ static int parse_dmap_header(const unsigned char *metadata, char *tag, int *len)
+@@ -1913,7 +2159,40 @@ static int parse_dmap_header(const unsigned char *metadata, char *tag, int *len)
  static int register_dnssd() {
      int dnssd_error;
      uint64_t features;
@@ -2026,16 +2633,23 @@ index 06e528c..214c83e 100644
 +     * DllMain fixed the timing but not the channel; this is the channel.
 +     *
 +     * Optional by construction, so an older shim (or Apple's) is not an error.
-+     * Once per process: register_dnssd runs once per engine start, and the tray
-+     * restarts the engine on every settings change. */
-+    static bool dnssd_dll_identified = false;
-+    if (!dnssd_dll_identified) {
-+        dnssd_dll_identified = true;
++     *
++     * Deliberately NOT guarded to once per process. The first attempt was, and
++     * the line never appeared on Windows even though this block was compiled in
++     * and register_dnssd() demonstrably ran — and a one-shot static is exactly
++     * the thing that cannot be told apart from "did not execute", because any
++     * earlier call that bailed at the raop registration below would have eaten
++     * the flag without logging anything. register_dnssd() runs once per engine
++     * start, so unguarded costs one line per start and is always true. */
++    {
 +        HMODULE dll = GetModuleHandleA("dnssd.dll");   /* already loaded by dnssd_init */
 +        typedef const char * (__stdcall *shim_version_t)(void);
 +        shim_version_t shim_version = dll
 +            ? (shim_version_t) GetProcAddress(dll, "PopyachsaShimVersion") : NULL;
-+        LOGI("dnssd.dll: %s", shim_version ? shim_version()
++        /* Called out here, not inside the varargs: a bad return would otherwise
++           take vsnprintf down inside log() with the format half-written. */
++        const char *version = shim_version ? shim_version() : NULL;
++        LOGI("dnssd.dll: %s", version ? version
 +             : "no PopyachsaShimVersion export — Apple Bonjour, or a shim older than 1.1.0");
 +    }
 +#endif
@@ -2043,7 +2657,7 @@ index 06e528c..214c83e 100644
      dnssd_error = dnssd_register_raop(dnssd, raop_port);
      if (dnssd_error) {
          if (ble_filename.empty()) {
-@@ -1987,6 +2252,10 @@ static int start_dnssd(std::vector<char> hw_addr, std::string name) {
+@@ -1987,6 +2266,10 @@ static int start_dnssd(std::vector<char> hw_addr, std::string name) {
          return 1;
      }
  
@@ -2054,7 +2668,7 @@ index 06e528c..214c83e 100644
      /* after dnssd starts, reset the default feature set here 
       * (overwrites features set in dnssdint.h)
       * default: FEATURES_1 = 0x5A7FFEE6, FEATURES_2 = 0 */
-@@ -2472,9 +2741,9 @@ extern "C" void audio_get_format (void *cls, unsigned char *ct, unsigned short *
+@@ -2472,9 +2755,9 @@ extern "C" void audio_get_format (void *cls, unsigned char *ct, unsigned short *
      }
  }
  
@@ -2066,7 +2680,7 @@ index 06e528c..214c83e 100644
      }
  }
  
-@@ -2662,7 +2931,15 @@ extern "C" void on_video_acquire_playback_info (void *cls, playback_info_t *play
+@@ -2662,7 +2945,15 @@ extern "C" void on_video_acquire_playback_info (void *cls, playback_info_t *play
      }
  }
  
@@ -2082,7 +2696,7 @@ index 06e528c..214c83e 100644
      switch (level) {
      case LOGGER_DEBUG:
          LOGD("%s", msg);
-@@ -2776,7 +3053,9 @@ static void stop_raop_server () {
+@@ -2776,7 +3067,9 @@ static void stop_raop_server () {
      return;
  }
  
@@ -2093,7 +2707,7 @@ index 06e528c..214c83e 100644
      std::string config_file = filename;
      std::string option_char = "-";
      std::vector<std::string> options;
-@@ -2847,47 +3126,214 @@ static void read_config_file(const char * filename, const char * uxplay_name) {
+@@ -2847,47 +3140,214 @@ static void read_config_file(const char * filename, const char * uxplay_name) {
      if (options.size() > 1) {
  
          int argc = options.size();
@@ -2330,7 +2944,7 @@ index 06e528c..214c83e 100644
  
  #ifdef __OpenBSD__
      if (unveil("/", "rwc") == -1 || unveil(NULL, NULL) == -1) {
-@@ -2917,11 +3363,13 @@ int main (int argc, char *argv[]) {
+@@ -2917,11 +3377,13 @@ int main (int argc, char *argv[]) {
              struct stat sb;
              if (i+1 == argc) {
                  LOGE ("option -rc requires a filename  (-rc <filename>)");
@@ -2344,7 +2958,7 @@ index 06e528c..214c83e 100644
                  exit(0);
              }
              break;
-@@ -2932,10 +3380,21 @@ int main (int argc, char *argv[]) {
+@@ -2932,10 +3394,21 @@ int main (int argc, char *argv[]) {
      } else {	
          config_file = find_uxplay_config_file();
      }
@@ -2368,7 +2982,7 @@ index 06e528c..214c83e 100644
  
      log_level = (debug_log ? LOGGER_DEBUG_DATA : LOGGER_INFO);
      if (debug_log && suppress_packet_debug_data) {
-@@ -3068,7 +3527,13 @@ int main (int argc, char *argv[]) {
+@@ -3068,7 +3541,13 @@ int main (int argc, char *argv[]) {
          video_parser.append(BT709_FIX);
      }
  
@@ -2383,7 +2997,7 @@ index 06e528c..214c83e 100644
          std::string option = video_converter;
          video_converter.append(SRGB_FIX);
          video_converter.append(option);
-@@ -3127,6 +3592,8 @@ int main (int argc, char *argv[]) {
+@@ -3127,6 +3606,8 @@ int main (int argc, char *argv[]) {
  
      if (!gstreamer_init()) {
          LOGE ("stopping");
@@ -2392,7 +3006,7 @@ index 06e528c..214c83e 100644
          exit (1);
      }
  
-@@ -3161,6 +3628,41 @@ int main (int argc, char *argv[]) {
+@@ -3161,6 +3642,41 @@ int main (int argc, char *argv[]) {
          LOGI("using network ports UDP %d %d %d TCP %d %d %d", udp[0], udp[1], udp[2], tcp[0], tcp[1], tcp[2]);
      }
  
@@ -2434,7 +3048,7 @@ index 06e528c..214c83e 100644
      if (!use_random_hw_addr) {
          if (strlen(mac_address.c_str()) == 0) {
              mac_address = find_mac();
-@@ -3198,10 +3700,12 @@ int main (int argc, char *argv[]) {
+@@ -3198,10 +3714,12 @@ int main (int argc, char *argv[]) {
  
      if (start_dnssd(server_hw_addr, server_name)) {
          cleanup();
@@ -2447,7 +3061,7 @@ index 06e528c..214c83e 100644
      }
  
      if (lang.length() > 1) {
-@@ -3226,19 +3730,29 @@ int main (int argc, char *argv[]) {
+@@ -3226,19 +3744,29 @@ int main (int argc, char *argv[]) {
          stop_raop_server();
          stop_dnssd();
          cleanup();
@@ -2479,7 +3093,7 @@ index 06e528c..214c83e 100644
              video_renderer_destroy();
              if (!preserve_connections) {
                  url.erase();
-@@ -3267,8 +3781,69 @@ int main (int argc, char *argv[]) {
+@@ -3267,8 +3795,69 @@ int main (int argc, char *argv[]) {
          stop_dnssd();
      }
      cleanup();
@@ -2550,7 +3164,7 @@ index 06e528c..214c83e 100644
  static void cleanup() {
      if (use_audio) {
          audio_renderer_destroy();
-@@ -3278,12 +3853,18 @@ static void cleanup() {
+@@ -3278,12 +3867,18 @@ static void cleanup() {
      }
      logger_destroy(render_logger);
      render_logger = NULL;
@@ -2569,7 +3183,7 @@ index 06e528c..214c83e 100644
      }
      if (coverart_filename.length()) {
          remove (coverart_filename.c_str());
-@@ -3307,5 +3888,11 @@ static void cleanup() {
+@@ -3307,5 +3902,11 @@ static void cleanup() {
          dbus_connection_unref(dbus_connection);
      }
  #endif

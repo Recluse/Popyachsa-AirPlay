@@ -30,7 +30,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
       gstreamer1.0-libav gstreamer1.0-x gstreamer1.0-tools \
       libgtk-3-dev libxdo-dev libayatana-appindicator3-dev libx11-dev libwayland-dev \
+      libxv-dev \
+      patchelf file desktop-file-utils zsync squashfs-tools \
     && rm -rf /var/lib/apt/lists/*
+# The second line is the AppImage toolchain's own dependencies. build-appimage.sh
+# has to run INSIDE this container, not on the Docker host: linuxdeploy resolves
+# the binary's shared libraries against whatever system it runs on, and the host
+# is 20.04 while this is 24.04 — running it outside fails on the engine's
+# libplist and would otherwise mix two distributions' libraries into one image.
+# Without patchelf the gstreamer plugin aborts; without zsync appimagetool
+# silently skips the delta-update file the in-app updater needs.
+# libxv-dev is not optional and was missing here: the engine links libXv to count
+# XVideo ports, so without it the Rust binary fails to LINK — `rust-lld: unable to
+# find library -lXv` — after cmake, ninja and cargo have all reported success.
+# BUILD.md was corrected for this months ago; this file, which is supposed to BE
+# the reproducible environment, was not.
 
 # Rust via rustup into a world-readable prefix so any UID mounted into the
 # container can use it (we mount the repo and build as an arbitrary user).

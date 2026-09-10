@@ -4,7 +4,10 @@
 # plugins (linuxdeploy-plugin-gstreamer). Built on Ubuntu 24.04 here -> glibc
 # 2.39 floor (older glibc needs newer libplist/GLib built from source; TODO).
 set -eo pipefail   # pipefail so a failed build in a `... | tail` pipeline still aborts
-ROOT=/home/recluse/l3
+# Overridable: this used to be a hard-coded path into one person's home, so a
+# second build tree on the same host (or a CI runner) could not use the script
+# at all without editing it.
+ROOT="${ROOT:-/home/recluse/l3}"
 APP=$ROOT/popyachsa-airplay
 AI=$ROOT/appimage
 APPDIR=$AI/AppDir
@@ -68,15 +71,40 @@ Terminal=false
 EOF
 
 cd "$AI"
+# GIO TLS backend. AirPlay *video* is HLS: playbin fetches the segments from the
+# sender's CDN over HTTPS through souphttpsrc -> libsoup -> the BUNDLED libgio,
+# whose module directory is the build host's path and does not exist on Fedora
+# (and holds nothing on a minimal Debian). glib-networking is not a GStreamer
+# plugin, so `--plugin gstreamer` never sees it; without it every HTTPS fetch
+# fails and hlsdemux2 reports "Couldn't download fragments" — the Windows 0.2.13
+# defect, one platform over. Deploy it like any other lib (linuxdeploy pulls its
+# deps), move it where GIO looks, and point GIO there from an AppRun hook.
+GIOMOD=/usr/lib/x86_64-linux-gnu/gio/modules/libgiognutls.so
+[ -f "$GIOMOD" ] || { echo "FATAL: $GIOMOD missing — apt install glib-networking" >&2; exit 1; }
+mkdir -p "$APPDIR/apprun-hooks"
+cat > "$APPDIR/apprun-hooks/gio-tls.sh" <<'EOF'
+#! /bin/bash
+export GIO_EXTRA_MODULES="${APPDIR}/usr/lib/gio/modules${GIO_EXTRA_MODULES:+:$GIO_EXTRA_MODULES}"
+EOF
+
 # 1. Populate AppDir: deploy the binary + uxplay-core.so deps + GStreamer plugins.
 #    NOTE: no `--output appimage` here — we PRUNE the host display libs (below)
 #    before packaging, so the pack must be a separate appimagetool step.
 "$AI/tools/linuxdeploy.AppImage" --appdir "$APPDIR" \
   -e "$APPDIR/usr/bin/popyachsa-airplay" \
   -l "$APP/target/$PROFILE/uxplay-core.so" \
+  -l "$GIOMOD" \
   -d "$AI/popyachsa-airplay.desktop" \
   -i "$AI/popyachsa-airplay.png" \
   --plugin gstreamer 2>&1 | tail -45
+
+# linuxdeploy dropped the module in usr/lib with RUNPATH $ORIGIN; GIO wants a
+# directory of its own, so move it and re-point the RUNPATH at usr/lib.
+mkdir -p "$APPDIR/usr/lib/gio/modules"
+mv "$APPDIR/usr/lib/libgiognutls.so" "$APPDIR/usr/lib/gio/modules/"
+patchelf --set-rpath '$ORIGIN/../..' "$APPDIR/usr/lib/gio/modules/libgiognutls.so"
+grep -q 'apprun-hooks/"gio-tls.sh"' "$APPDIR/AppRun" \
+  || { echo "FATAL: AppRun does not source apprun-hooks/gio-tls.sh" >&2; exit 1; }
 
 # 2. PRUNE the host display stack. An AppImage must NOT ship the X11 / xcb /
 #    xkbcommon / wayland client libs — they have to come from the user's system so
@@ -115,6 +143,13 @@ echo "=== result ==="
 # Confirm the display stack is GONE from the packaged image (must list nothing).
 echo "--- residual display libs in AppDir (expect none) ---"
 ls "$APPDIR/usr/lib/" | grep -E "^libX|^libxcb|^libxkbcommon|^libwayland" || echo "  (clean — no host display libs bundled)"
+# The HLS path, by name: a missing one of these is silent at runtime (video
+# "hangs" or "Couldn't download fragments"), so fail the build instead.
+for f in usr/lib/gstreamer-1.0/libgsthls.so usr/lib/gstreamer-1.0/libgstadaptivedemux2.so \
+         usr/lib/gstreamer-1.0/libgstsoup.so usr/lib/gio/modules/libgiognutls.so; do
+  [ -f "$APPDIR/$f" ] || { echo "FATAL: $f missing from AppDir" >&2; exit 1; }
+done
+echo "  HLS plugins + GIO TLS backend present"
 # Both the AppImage and its zsync control file (publish them together so the
 # delta update can find the .zsync alongside the AppImage).
 ls -la "$AI"/*.AppImage "$AI"/*.zsync 2>&1

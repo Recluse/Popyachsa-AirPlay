@@ -62,6 +62,25 @@ Remove-Item "$plugDst\libgstcodec2json.dll" -ErrorAction SilentlyContinue
 $plugins = Get-ChildItem "$plugDst\*.dll"
 Write-Host "[dist] copied $($plugins.Count) GStreamer plugins"
 
+# 2b. GIO modules (the TLS/HTTPS backend) are ALSO loaded dynamically — GLib loads
+#     them BY NAME out of lib\gio\modules\, never through an import table — so, like
+#     the GStreamer plugins above, they are INVISIBLE to the dep-walk in step 3 and
+#     must be copied explicitly. Without libgioopenssl/libgiognutls, GLib+libsoup
+#     have no TLS backend and souphttpsrc fails every https:// GET. That broke
+#     AirPlay *video*: YouTube/Photos/Safari hand us an HLS master whose fragments
+#     live on https:// CDNs (e.g. googlevideo.com), and with no TLS the demux logs
+#     "Couldn't download fragments" — the user just sees a frozen picture, no error.
+#     GENERAL RULE for this bundle: anything loaded dynamically by name rather than
+#     via an import table (GStreamer plugins, GIO modules, …) is invisible to the
+#     walk and needs its own explicit copy. Don't add a third such directory here
+#     without copying it too.
+$gioDst = Join-Path $DIST 'lib\gio\modules'
+New-Item -ItemType Directory -Force -Path $gioDst | Out-Null
+Copy-Item "$UCRT_LIB\gio\modules\libgioopenssl.dll" $gioDst -Force
+Copy-Item "$UCRT_LIB\gio\modules\libgiognutls.dll"  $gioDst -Force
+$gioModules = Get-ChildItem "$gioDst\*.dll"
+Write-Host "[dist] copied $($gioModules.Count) GIO modules (TLS/HTTPS backend)"
+
 # 3. Walk DLL deps recursively from the MinGW artefacts AND every plugin (the
 #    plugins pull in extra codec/runtime DLLs that uxplay-core.dll does not).
 #    The MSVC tray exe loads uxplay-core.dll dynamically, so its own import table
@@ -81,7 +100,7 @@ function Get-DllImports([string]$path) {
 $queue = New-Object System.Collections.Generic.Queue[string]
 $seen  = New-Object System.Collections.Generic.HashSet[string]
 
-$seed_imgs = @($CORE_DLL, $DNSSD_DLL) + ($plugins | ForEach-Object { $_.FullName })
+$seed_imgs = @($CORE_DLL, $DNSSD_DLL) + ($plugins | ForEach-Object { $_.FullName }) + ($gioModules | ForEach-Object { $_.FullName })
 if (Test-Path $GST_INSPECT) { $seed_imgs += $GST_INSPECT }
 foreach ($img in $seed_imgs) {
     foreach ($d in (Get-DllImports $img)) { [void]$queue.Enqueue($d) }

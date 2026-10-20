@@ -22,6 +22,10 @@ path = "src/bin/updater.rs"
 airplay-lib = { path = "../airplay-lib" }
 # Update channel: HTTPS fetch (rustls), Ed25519 signature verify, zip extract.
 ureq           = { version = "2", features = ["tls"] }
+# Direct dep for the trust-anchor list only; rustls types come from ureq's
+# re-export so the two cannot drift apart. Needed to build a filtered
+# RootCertStore (eMudhra deny-list) instead of ureq's stock webpki-roots one.
+webpki-roots   = "1.0"
 ed25519-compact = "2"
 sha2           = "0.10"
 hex            = "0.4"

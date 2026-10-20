@@ -98,6 +98,109 @@ pub struct Manifest {
     pub mirror_url: String,
 }
 
+/// Subject CNs of root CAs removed from the Mozilla trust store before TLS
+/// verification.
+///
+/// 2026-10-20 eMudhra Intermediate CA compromise: the intermediate signing key
+/// left eMudhra's control, so every chain anchored by these roots is untrustworthy
+/// regardless of which intermediate signed it. `webpki-roots` 1.0.10 still ships
+/// them, and ureq's default `root_certs()` would happily trust them, so the
+/// updater drops them at store-build time instead of waiting for upstream.
+///
+/// Matched against the CN in the trust anchor's DER subject (see
+/// `subject_mentions_name`). `emSign ECC Root CA - G3` and `AAA Certificate
+/// Services` are listed too (the originally compromised pair) even though the
+/// current store does not carry them — a deny-list must name the threat, not the
+/// inventory.
+const DENIED_ROOT_CNS: &[&str] = &[
+    "emSign Root CA - C1",
+    "emSign Root CA - G1",
+    "emSign ECC Root CA - C3",
+    "emSign ECC Root CA - G3",
+    "COMODO ECC Certification Authority",
+    "COMODO RSA Certification Authority",
+    "USERTrust ECC Certification Authority",
+    "USERTrust RSA Certification Authority",
+    "AAA Certificate Services",
+];
+
+/// True when `name` appears in the DER `Name` `subject` as a whole string
+/// attribute value.
+///
+/// DN attribute values are `tag + short length + raw bytes`; matching that
+/// framing (not a bare substring) is what makes the deny-list exact:
+/// "emSign Root CA - C1" must not pull down "emSign Root CA - C10", and
+/// "emSign Root CA - C" must not pull down "emSign Root CA - C1". The tags
+/// tried are the RFC 5280 DirectoryString set that encodes ASCII as raw
+/// bytes: PrintableString `0x13`, UTF8String `0x0c`, TeletexString `0x14`,
+/// plus IA5String `0x16`. BMPString/UniversalString store the name as UTF-16/
+/// UTF-32, so a raw-byte needle cannot appear there anyway and no separate
+/// branch is needed for them. All names in `DENIED_ROOT_CNS` are far below
+/// the 128-byte short-form length limit, so long-form lengths do not arise.
+fn subject_mentions_name(subject: &[u8], name: &str) -> bool {
+    let n = name.as_bytes();
+    if n.is_empty() || n.len() >= 128 {
+        return false;
+    }
+    for tag in [0x0cu8, 0x13, 0x14, 0x16] {
+        let mut needle = Vec::with_capacity(2 + n.len());
+        needle.push(tag);
+        needle.push(n.len() as u8);
+        needle.extend_from_slice(n);
+        if subject.windows(needle.len()).any(|w| w == needle.as_slice()) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Mozilla trust store minus `DENIED_ROOT_CNS`. Returns the store and how many
+/// anchors were dropped.
+fn filtered_root_store() -> (ureq::rustls::RootCertStore, usize) {
+    let mut removed = 0usize;
+    let roots: Vec<_> = webpki_roots::TLS_SERVER_ROOTS
+        .iter()
+        .filter(|anchor| {
+            let denied = DENIED_ROOT_CNS
+                .iter()
+                .any(|cn| subject_mentions_name(anchor.subject.as_ref(), cn));
+            if denied {
+                removed += 1;
+            }
+            !denied
+        })
+        .cloned()
+        .collect();
+    (ureq::rustls::RootCertStore { roots }, removed)
+}
+
+/// rustls client config over the filtered store. Built once per process: the
+/// deny-list is a compile-time constant and the store is immutable afterwards.
+fn tls_config() -> std::sync::Arc<ureq::rustls::ClientConfig> {
+    use std::sync::OnceLock;
+    static CONFIG: OnceLock<std::sync::Arc<ureq::rustls::ClientConfig>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            let (store, removed) = filtered_root_store();
+            eprintln!(
+                "[update] TLS trust store: dropped {removed} compromised root(s), {} remain",
+                store.roots.len()
+            );
+            // Same builder ureq's own default connector uses: *ring* is switched
+            // on by ureq's `tls` feature, so the crypto provider is unambiguous
+            // and does not depend on a process-wide default being installed.
+            let cfg = ureq::rustls::ClientConfig::builder_with_provider(
+                ureq::rustls::crypto::ring::default_provider().into(),
+            )
+            .with_protocol_versions(&[&ureq::rustls::version::TLS12, &ureq::rustls::version::TLS13])
+            .expect("ring provider always offers TLS 1.2 and 1.3")
+            .with_root_certificates(store)
+            .with_no_client_auth();
+            std::sync::Arc::new(cfg)
+        })
+        .clone()
+}
+
 /// HTTP GET into memory (capped, with a timeout). Used for the manifest and,
 /// in the updater, for the release zip.
 pub fn download(url: &str, cap_bytes: u64) -> Result<Vec<u8>> {
@@ -109,6 +212,7 @@ pub fn download(url: &str, cap_bytes: u64) -> Result<Vec<u8>> {
     }
     let resp = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(30))
+        .tls_config(tls_config())
         .build()
         .get(url)
         .call()
@@ -299,6 +403,46 @@ mod tests {
         let mut m = parse(LIVE_MACOS_MANIFEST);
         m.signature_v2 = LIVE_LEGACY_SIG.into(); // a valid legacy sig is NOT a valid v2
         assert!(verify_signature(&m).is_err());
+    }
+
+    #[test]
+    fn every_denied_root_cn_is_dropped_from_the_trust_store() {
+        let (store, removed) = filtered_root_store();
+        assert_eq!(removed, 7, "webpki-roots 1.0.10 carries exactly 7 of the 9 denied CNs");
+        for cn in DENIED_ROOT_CNS {
+            assert!(
+                !store
+                    .roots
+                    .iter()
+                    .any(|a| subject_mentions_name(a.subject.as_ref(), cn)),
+                "denied root {cn:?} survived the filter"
+            );
+        }
+        // A store with zero roots would also pass the loop above — make sure the
+        // filter did not simply empty the store.
+        assert!(
+            store.roots.len() > 100,
+            "filter removed far too much: {} roots left",
+            store.roots.len()
+        );
+    }
+
+    #[test]
+    fn subject_name_matching_is_exact_not_substring() {
+        // The real emSign Root CA - C1 subject fragment, CN encoded as a
+        // PrintableString (0x13) of length 0x13.
+        let cn = b"1\x1c0\x1a\x06\x03U\x04\x03\x13\x13emSign Root CA - C1";
+        assert!(subject_mentions_name(cn, "emSign Root CA - C1"));
+        // Prefix of a denied name must NOT match — otherwise a future root
+        // called "emSign Root CA - C" would be blocked by accident.
+        assert!(!subject_mentions_name(cn, "emSign Root CA - C"));
+        // Extension of a denied name must NOT match.
+        assert!(!subject_mentions_name(cn, "emSign Root CA - C10"));
+        // Unframed raw bytes are not a DN string value and must not match.
+        assert!(!subject_mentions_name(b"emSign Root CA - C1", "emSign Root CA - C1"));
+        // UTF8String (0x0c) framing is recognised too.
+        let utf8 = b"\x0c\x13emSign Root CA - C1";
+        assert!(subject_mentions_name(utf8, "emSign Root CA - C1"));
     }
 
     #[test]
